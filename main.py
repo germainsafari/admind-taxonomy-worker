@@ -3,6 +3,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 
+from flask import Flask, jsonify
 from google.cloud import bigquery
 from google.cloud import firestore
 import vertexai
@@ -410,9 +411,10 @@ def wiki_generate_all():
         generate_wiki_for_project(project.project_id)
 
 
-if __name__ == "__main__":
-    job = os.getenv("JOB_TYPE", "taxonomy-sync")
+app = Flask(__name__)
 
+
+def run_job(job: str):
     if job == "taxonomy-sync":
         taxonomy_sync()
     elif job == "wiki-generate":
@@ -424,3 +426,23 @@ if __name__ == "__main__":
         generate_wiki_for_project(project_id)
     else:
         raise RuntimeError(f"Unknown JOB_TYPE: {job}")
+
+
+@app.route("/", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route("/run", methods=["POST"])
+def trigger():
+    job = os.getenv("JOB_TYPE", "taxonomy-sync")
+    try:
+        run_job(job)
+        return jsonify({"status": "ok", "job": job}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "job": job, "error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
