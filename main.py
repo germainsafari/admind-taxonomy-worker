@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -9,17 +10,127 @@ from google.cloud import firestore
 import vertexai
 from vertexai.generative_models import GenerativeModel, GenerationConfig
 
+logger = logging.getLogger(__name__)
 
 PROJECT_ID = os.getenv("PROJECT_ID", "admind-data-organisation")
 DATASET = os.getenv("DATASET", "admind_data_organisation")
 LOCATION = os.getenv("LOCATION", "europe-west4")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "auto").lower()
 
 bq = bigquery.Client(project=PROJECT_ID)
 db = firestore.Client(project=PROJECT_ID)
 
-vertexai.init(project=PROJECT_ID, location=LOCATION)
-model = GenerativeModel(MODEL_NAME)
+_gemini_model = None
+_gemini_unavailable = False
+_openai_client = None
+_active_llm_label = None
+
+
+def _openai_api_key():
+    return os.getenv("OPENAI_API_KEY", "").strip()
+
+
+def _get_openai_client():
+    global _openai_client
+    if _openai_client is not None:
+        return _openai_client
+
+    api_key = _openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    from openai import OpenAI
+
+    _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
+
+
+def _get_gemini_model():
+    global _gemini_model, _gemini_unavailable
+
+    if _gemini_unavailable:
+        return None
+    if _gemini_model is not None:
+        return _gemini_model
+
+    try:
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        _gemini_model = GenerativeModel(MODEL_NAME)
+        return _gemini_model
+    except Exception as e:
+        _gemini_unavailable = True
+        logger.warning("Gemini unavailable, will use OpenAI if configured: %s", e)
+        return None
+
+
+def _generate_with_gemini(prompt: str, *, temperature: float, json_mode: bool) -> str:
+    gemini = _get_gemini_model()
+    if gemini is None:
+        raise RuntimeError("Gemini is not available")
+
+    config_kwargs = {"temperature": temperature}
+    if json_mode:
+        config_kwargs["response_mime_type"] = "application/json"
+
+    response = gemini.generate_content(
+        prompt,
+        generation_config=GenerationConfig(**config_kwargs),
+    )
+    return response.text
+
+
+def _generate_with_openai(prompt: str, *, temperature: float, json_mode: bool) -> str:
+    client = _get_openai_client()
+    kwargs = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": temperature,
+    }
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = client.chat.completions.create(**kwargs)
+    return response.choices[0].message.content or ""
+
+
+def generate_text(prompt: str, *, temperature: float = 0, json_mode: bool = False) -> str:
+    """Generate text with Gemini when possible; fall back to OpenAI when configured."""
+    global _active_llm_label
+
+    if LLM_PROVIDER == "openai":
+        _active_llm_label = f"openai:{OPENAI_MODEL}"
+        return _generate_with_openai(prompt, temperature=temperature, json_mode=json_mode)
+
+    if LLM_PROVIDER == "gemini":
+        _active_llm_label = f"gemini:{MODEL_NAME}"
+        return _generate_with_gemini(prompt, temperature=temperature, json_mode=json_mode)
+
+    # auto: prefer Gemini, fall back to OpenAI
+    try:
+        _active_llm_label = f"gemini:{MODEL_NAME}"
+        return _generate_with_gemini(prompt, temperature=temperature, json_mode=json_mode)
+    except Exception as gemini_error:
+        if not _openai_api_key():
+            raise RuntimeError(
+                "Gemini failed and OPENAI_API_KEY is not set for fallback"
+            ) from gemini_error
+
+        logger.warning("Gemini failed, using OpenAI fallback: %s", gemini_error)
+        _active_llm_label = f"openai:{OPENAI_MODEL}"
+        return _generate_with_openai(prompt, temperature=temperature, json_mode=json_mode)
+
+
+def active_llm_label() -> str:
+    return _active_llm_label or "unknown"
+
+
+def classifier_matching_method() -> str:
+    label = active_llm_label()
+    if label.startswith("openai:"):
+        return "openai_classification"
+    return "gemini_classification"
 
 
 def now_iso():
@@ -132,18 +243,12 @@ Documents:
 {json.dumps(document_chunks, ensure_ascii=False)}
 """
 
-    response = model.generate_content(
-        prompt,
-        generation_config=GenerationConfig(
-            temperature=0,
-            response_mime_type="application/json",
-        ),
-    )
+    raw = generate_text(prompt, temperature=0, json_mode=True)
 
     try:
-        parsed = json.loads(response.text)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
-        raise RuntimeError(f"Gemini returned invalid JSON: {response.text}")
+        raise RuntimeError(f"LLM returned invalid JSON: {raw}")
 
     return parsed.get("matches", [])
 
@@ -189,7 +294,7 @@ def taxonomy_sync():
                         "project_id": project.project_id,
                         "document_id": match["document_id"],
                         "confidence_score": float(match.get("confidence_score", 0)),
-                        "matching_method": "gemini_classification",
+                        "matching_method": classifier_matching_method(),
                         "classifier_reason": match.get("reason"),
                         "classified_at": now_iso(),
                         "run_id": run_id,
@@ -356,14 +461,8 @@ Source documents:
 {json.dumps(source_docs, ensure_ascii=False)}
 """
 
-    response = model.generate_content(
-        prompt,
-        generation_config=GenerationConfig(
-            temperature=0.2,
-        ),
-    )
-
-    markdown = response.text
+    markdown = generate_text(prompt, temperature=0.2, json_mode=False)
+    model_used = active_llm_label()
 
     db.collection("wiki").document(project_id).set(
         {
@@ -373,7 +472,7 @@ Source documents:
             "client_name": project.client_name,
             "markdown": markdown,
             "generated_at": firestore.SERVER_TIMESTAMP,
-            "generated_by_model": MODEL_NAME,
+            "generated_by_model": model_used,
             "source_document_ids": [doc.document_id for doc in docs],
         }
     )
@@ -430,7 +529,15 @@ def run_job(job: str):
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify(
+        {
+            "status": "ok",
+            "llm_provider": LLM_PROVIDER,
+            "gemini_model": MODEL_NAME,
+            "openai_model": OPENAI_MODEL,
+            "openai_configured": bool(_openai_api_key()),
+        }
+    ), 200
 
 
 @app.route("/run", methods=["POST"])
