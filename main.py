@@ -252,10 +252,15 @@ Documents:
     return parsed.get("matches", [])
 
 
-def taxonomy_sync():
-    run_id = str(uuid.uuid4())
-    started_at = now_iso()
-
+def insert_taxonomy_run(
+    run_id,
+    started_at,
+    status,
+    projects_processed=0,
+    documents_processed=0,
+    mappings_created=0,
+    error_message=None,
+):
     insert_rows(
         "taxonomy_runs",
         [
@@ -263,18 +268,24 @@ def taxonomy_sync():
                 "run_id": run_id,
                 "job_name": "taxonomy-sync",
                 "started_at": started_at,
-                "finished_at": None,
-                "status": "running",
-                "projects_processed": 0,
-                "documents_processed": 0,
-                "mappings_created": 0,
-                "error_message": None,
+                "finished_at": now_iso(),
+                "status": status,
+                "projects_processed": projects_processed,
+                "documents_processed": documents_processed,
+                "mappings_created": mappings_created,
+                "error_message": error_message[:1000] if error_message else None,
             }
         ],
     )
 
+
+def taxonomy_sync():
+    run_id = str(uuid.uuid4())
+    started_at = now_iso()
+
     projects_processed = 0
     mappings_created = 0
+    documents = []
 
     try:
         projects = get_active_projects(limit=int(os.getenv("PROJECT_LIMIT", "20")))
@@ -304,12 +315,13 @@ def taxonomy_sync():
             projects_processed += 1
             mappings_created += len(rows)
 
-        update_run_success(
-            "taxonomy_runs",
-            run_id,
-            projects_processed,
-            len(documents),
-            mappings_created,
+        insert_taxonomy_run(
+            run_id=run_id,
+            started_at=started_at,
+            status="success",
+            projects_processed=projects_processed,
+            documents_processed=len(documents),
+            mappings_created=mappings_created,
         )
 
         print(
@@ -325,52 +337,16 @@ def taxonomy_sync():
         )
 
     except Exception as e:
-        update_run_error("taxonomy_runs", run_id, str(e))
+        insert_taxonomy_run(
+            run_id=run_id,
+            started_at=started_at,
+            status="error",
+            projects_processed=projects_processed,
+            documents_processed=len(documents),
+            mappings_created=mappings_created,
+            error_message=str(e),
+        )
         raise
-
-
-def update_run_success(table_name, run_id, projects_processed, documents_processed, mappings_created):
-    sql = f"""
-    UPDATE `{PROJECT_ID}.{DATASET}.{table_name}`
-    SET
-      finished_at = CURRENT_TIMESTAMP(),
-      status = 'success',
-      projects_processed = @projects_processed,
-      documents_processed = @documents_processed,
-      mappings_created = @mappings_created
-    WHERE run_id = @run_id
-    """
-    bq.query(
-        sql,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
-                bigquery.ScalarQueryParameter("projects_processed", "INT64", projects_processed),
-                bigquery.ScalarQueryParameter("documents_processed", "INT64", documents_processed),
-                bigquery.ScalarQueryParameter("mappings_created", "INT64", mappings_created),
-            ]
-        ),
-    ).result()
-
-
-def update_run_error(table_name, run_id, error_message):
-    sql = f"""
-    UPDATE `{PROJECT_ID}.{DATASET}.{table_name}`
-    SET
-      finished_at = CURRENT_TIMESTAMP(),
-      status = 'error',
-      error_message = @error_message
-    WHERE run_id = @run_id
-    """
-    bq.query(
-        sql,
-        job_config=bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter("run_id", "STRING", run_id),
-                bigquery.ScalarQueryParameter("error_message", "STRING", error_message[:1000]),
-            ]
-        ),
-    ).result()
 
 
 def get_project(project_id):
