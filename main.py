@@ -335,13 +335,22 @@ def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
     if body_extra:
         body.update(body_extra)
 
+    url = f"{SCORO_BASE_URL}/api/v2/{endpoint}"
+    logger.info("Scoro POST %s", url)
+
     resp = requests.post(
-        f"{SCORO_BASE_URL}/api/v2/{endpoint}",
+        url,
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         json=body,
         timeout=60,
     )
-    resp.raise_for_status()
+
+    if not resp.ok or not resp.text.strip().startswith("{"):
+        raise RuntimeError(
+            f"Scoro API unexpected response on /{endpoint}: "
+            f"HTTP {resp.status_code} — {resp.text[:500]}"
+        )
+
     data = resp.json()
     if data.get("status") != "OK":
         raise RuntimeError(f"Scoro API error on /{endpoint}: {data.get('messages') or data}")
