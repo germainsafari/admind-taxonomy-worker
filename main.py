@@ -425,10 +425,22 @@ def upsert_projects(rows: list[dict]):
     if not rows:
         return
 
+    # Explicit all-STRING schema so the staging table never mis-infers types
+    # (e.g. numeric-looking scoro_id as INT64). Dates are cast in the MERGE.
+    string_fields = [
+        "project_id", "scoro_id", "project_no", "project_name", "status",
+        "project_manager", "project_members", "start_date", "due_date",
+        "completed_date", "description", "client_company", "project_type",
+        "client_country", "business_area", "business_line_division",
+        "budget_type", "po_number", "open_po_number", "related_project",
+        "google_drive_link", "project_priority",
+    ]
+    schema = [bigquery.SchemaField(f, "STRING") for f in string_fields]
+
     tmp = f"{PROJECT_ID}.{DATASET}._tmp_projects_{uuid.uuid4().hex[:8]}"
     bq.load_table_from_json(
         rows, tmp,
-        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True),
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", schema=schema),
     ).result()
 
     try:
@@ -603,10 +615,16 @@ def upsert_documents(rows: list[dict]):
     if not rows:
         return
 
+    string_fields = [
+        "document_id", "source_system", "source_type", "title", "folder_path",
+        "url", "author", "text_preview", "full_text",
+    ]
+    schema = [bigquery.SchemaField(f, "STRING") for f in string_fields]
+
     tmp = f"{PROJECT_ID}.{DATASET}._tmp_docs_{uuid.uuid4().hex[:8]}"
     bq.load_table_from_json(
         rows, tmp,
-        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True),
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", schema=schema),
     ).result()
 
     try:
