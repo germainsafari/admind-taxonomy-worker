@@ -1,3 +1,11 @@
+"""
+admind-taxonomy-worker  —  Cloud Run Job
+Pipeline: Scoro → BigQuery.projects
+          Discovery Engine → BigQuery.documents
+          LLM classifier → BigQuery.project_document_map
+          LLM wiki writer → Firestore.wiki
+"""
+
 import json
 import logging
 import os
@@ -24,13 +32,20 @@ DATASET = os.getenv("DATASET", "admind_data_organisation")
 LOCATION = os.getenv("LOCATION", "europe-west4")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# auto  → Gemini API key → Vertex AI Gemini → OpenAI
+# gemini → Gemini API key → Vertex AI Gemini (no OpenAI fallback)
+# openai → OpenAI only
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "auto").lower()
 
 SCORO_BASE_URL = os.getenv("SCORO_BASE_URL", "").rstrip("/")
 SCORO_API_KEY = os.getenv("SCORO_API_KEY", "")
 SCORO_COMPANY_ACCOUNT_ID = os.getenv("SCORO_COMPANY_ACCOUNT_ID", "")
 
-DE_PROJECT = os.getenv("DISCOVERY_ENGINE_PROJECT_NUMBER") or os.getenv("DISCOVERY_ENGINE_PROJECT") or PROJECT_ID
+DE_PROJECT = (
+    os.getenv("DISCOVERY_ENGINE_PROJECT_NUMBER")
+    or os.getenv("DISCOVERY_ENGINE_PROJECT")
+    or PROJECT_ID
+)
 DE_LOCATION = os.getenv("DISCOVERY_ENGINE_LOCATION", "global")
 DE_COLLECTION = os.getenv("DISCOVERY_ENGINE_COLLECTION", "default_collection")
 DE_ENGINE_ID = os.getenv("DISCOVERY_ENGINE_ENGINE_ID", "")
@@ -41,21 +56,77 @@ DE_SERVING_CONFIG = os.getenv("DISCOVERY_ENGINE_SERVING_CONFIG", "default_search
 # ---------------------------------------------------------------------------
 
 bq = bigquery.Client(project=PROJECT_ID)
-db = firestore.Client(project=PROJECT_ID)
+db = firestore.Client(project=PROJECT_ID, database=os.getenv("FIRESTORE_DATABASE", "(default)"))
 
 # ---------------------------------------------------------------------------
 # LLM layer
+# Priority: Gemini Developer API (GEMINI_API_KEY) → Vertex AI Gemini → OpenAI
 # ---------------------------------------------------------------------------
 
-_gemini_model = None
-_gemini_unavailable = False
+_vertex_model = None
+_vertex_unavailable = False
 _openai_client = None
 _active_llm_label = None
 
 
-def _openai_api_key():
+def _gemini_api_key() -> str:
+    return os.getenv("GEMINI_API_KEY", "").strip()
+
+
+def _openai_api_key() -> str:
     return os.getenv("OPENAI_API_KEY", "").strip()
 
+
+# ── Gemini Developer API (AI Studio / google-generativeai) ──────────────────
+
+def _generate_with_gemini_api_key(prompt: str, *, temperature: float, json_mode: bool) -> str:
+    import google.generativeai as genai  # lazy import
+
+    genai.configure(api_key=_gemini_api_key())
+    config_kwargs = {"temperature": temperature}
+    if json_mode:
+        config_kwargs["response_mime_type"] = "application/json"
+    model = genai.GenerativeModel(MODEL_NAME)
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.GenerationConfig(**config_kwargs),
+    )
+    return response.text
+
+
+# ── Vertex AI Gemini (service account, no API key needed) ───────────────────
+
+def _get_vertex_model():
+    global _vertex_model, _vertex_unavailable
+    if _vertex_unavailable:
+        return None
+    if _vertex_model is not None:
+        return _vertex_model
+    try:
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        _vertex_model = GenerativeModel(MODEL_NAME)
+        return _vertex_model
+    except Exception as e:
+        _vertex_unavailable = True
+        logger.warning("Vertex AI Gemini unavailable: %s", e)
+        return None
+
+
+def _generate_with_vertex_gemini(prompt: str, *, temperature: float, json_mode: bool) -> str:
+    model = _get_vertex_model()
+    if model is None:
+        raise RuntimeError("Vertex AI Gemini is not available")
+    config_kwargs = {"temperature": temperature}
+    if json_mode:
+        config_kwargs["response_mime_type"] = "application/json"
+    response = model.generate_content(
+        prompt,
+        generation_config=GenerationConfig(**config_kwargs),
+    )
+    return response.text
+
+
+# ── OpenAI ──────────────────────────────────────────────────────────────────
 
 def _get_openai_client():
     global _openai_client
@@ -67,36 +138,6 @@ def _get_openai_client():
     from openai import OpenAI
     _openai_client = OpenAI(api_key=api_key)
     return _openai_client
-
-
-def _get_gemini_model():
-    global _gemini_model, _gemini_unavailable
-    if _gemini_unavailable:
-        return None
-    if _gemini_model is not None:
-        return _gemini_model
-    try:
-        vertexai.init(project=PROJECT_ID, location=LOCATION)
-        _gemini_model = GenerativeModel(MODEL_NAME)
-        return _gemini_model
-    except Exception as e:
-        _gemini_unavailable = True
-        logger.warning("Gemini unavailable, will use OpenAI fallback: %s", e)
-        return None
-
-
-def _generate_with_gemini(prompt: str, *, temperature: float, json_mode: bool) -> str:
-    gemini = _get_gemini_model()
-    if gemini is None:
-        raise RuntimeError("Gemini is not available")
-    config_kwargs = {"temperature": temperature}
-    if json_mode:
-        config_kwargs["response_mime_type"] = "application/json"
-    response = gemini.generate_content(
-        prompt,
-        generation_config=GenerationConfig(**config_kwargs),
-    )
-    return response.text
 
 
 def _generate_with_openai(prompt: str, *, temperature: float, json_mode: bool) -> str:
@@ -112,29 +153,54 @@ def _generate_with_openai(prompt: str, *, temperature: float, json_mode: bool) -
     return response.choices[0].message.content or ""
 
 
+# ── Router ───────────────────────────────────────────────────────────────────
+
 def generate_text(prompt: str, *, temperature: float = 0, json_mode: bool = False) -> str:
-    """Generate text, preferring Gemini and falling back to OpenAI when LLM_PROVIDER=auto."""
+    """
+    LLM_PROVIDER=auto   → Gemini API key → Vertex AI Gemini → OpenAI
+    LLM_PROVIDER=gemini → Gemini API key → Vertex AI Gemini  (no OpenAI fallback)
+    LLM_PROVIDER=openai → OpenAI only
+    """
     global _active_llm_label
 
     if LLM_PROVIDER == "openai":
         _active_llm_label = f"openai:{OPENAI_MODEL}"
         return _generate_with_openai(prompt, temperature=temperature, json_mode=json_mode)
 
-    if LLM_PROVIDER == "gemini":
-        _active_llm_label = f"gemini:{MODEL_NAME}"
-        return _generate_with_gemini(prompt, temperature=temperature, json_mode=json_mode)
+    gemini_errors: list[str] = []
 
+    # 1. Gemini Developer API (requires GEMINI_API_KEY)
+    if _gemini_api_key():
+        try:
+            _active_llm_label = f"gemini-api:{MODEL_NAME}"
+            return _generate_with_gemini_api_key(prompt, temperature=temperature, json_mode=json_mode)
+        except Exception as e:
+            gemini_errors.append(f"Gemini API key: {e}")
+            logger.warning("Gemini Developer API failed, trying next option: %s", e)
+
+    # 2. Vertex AI Gemini (uses service account — no API key needed)
     try:
-        _active_llm_label = f"gemini:{MODEL_NAME}"
-        return _generate_with_gemini(prompt, temperature=temperature, json_mode=json_mode)
-    except Exception as gemini_error:
-        if not _openai_api_key():
-            raise RuntimeError(
-                "Gemini failed and OPENAI_API_KEY is not set for fallback"
-            ) from gemini_error
-        logger.warning("Gemini failed, using OpenAI fallback: %s", gemini_error)
-        _active_llm_label = f"openai:{OPENAI_MODEL}"
-        return _generate_with_openai(prompt, temperature=temperature, json_mode=json_mode)
+        _active_llm_label = f"gemini-vertex:{MODEL_NAME}"
+        return _generate_with_vertex_gemini(prompt, temperature=temperature, json_mode=json_mode)
+    except Exception as e:
+        gemini_errors.append(f"Vertex AI Gemini: {e}")
+        logger.warning("Vertex AI Gemini failed: %s", e)
+
+    # 3. OpenAI fallback (only when LLM_PROVIDER=auto)
+    if LLM_PROVIDER == "gemini":
+        raise RuntimeError(
+            f"LLM_PROVIDER=gemini but all Gemini options failed: {'; '.join(gemini_errors)}"
+        )
+
+    if not _openai_api_key():
+        raise RuntimeError(
+            f"All Gemini options failed and OPENAI_API_KEY is not set. "
+            f"Errors: {'; '.join(gemini_errors)}"
+        )
+
+    logger.warning("All Gemini options failed — falling back to OpenAI")
+    _active_llm_label = f"openai:{OPENAI_MODEL}"
+    return _generate_with_openai(prompt, temperature=temperature, json_mode=json_mode)
 
 
 def active_llm_label() -> str:
@@ -149,11 +215,11 @@ def classifier_matching_method() -> str:
 # ---------------------------------------------------------------------------
 
 
-def now_iso():
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_query(sql: str, params=None):
+def run_query(sql: str, params=None) -> list:
     job_config = None
     if params:
         job_config = bigquery.QueryJobConfig(query_parameters=params)
@@ -169,7 +235,7 @@ def insert_rows(table_name: str, rows: list[dict]):
         raise RuntimeError(f"BigQuery insert errors for {table_name}: {errors}")
 
 
-def _row(row, field, default=""):
+def _row(row, field: str, default=""):
     """Safely read a field from a BigQuery row; returns default if the column is absent."""
     try:
         val = getattr(row, field, None)
@@ -187,39 +253,38 @@ def log_pipeline_run(
     records_written: int = 0,
     error_message: str | None = None,
 ):
-    """Append-only log to pipeline_runs. Never updates existing rows (avoids BQ streaming-buffer error)."""
+    """Append-only log to pipeline_runs. Never updates — avoids BQ streaming-buffer error."""
     insert_rows(
         "pipeline_runs",
-        [
-            {
-                "run_id": run_id,
-                "job_name": job_name,
-                "started_at": started_at,
-                "finished_at": now_iso(),
-                "status": status,
-                "records_read": records_read,
-                "records_written": records_written,
-                "error_message": error_message[:1000] if error_message else None,
-            }
-        ],
+        [{
+            "run_id": run_id,
+            "job_name": job_name,
+            "started_at": started_at,
+            "finished_at": now_iso(),
+            "status": status,
+            "records_read": records_read,
+            "records_written": records_written,
+            "error_message": error_message[:1000] if error_message else None,
+        }],
     )
 
 # ---------------------------------------------------------------------------
 # BigQuery data accessors
+# Schema: see SCHEMA.md
 # ---------------------------------------------------------------------------
 
 
-def get_active_projects(limit: int = 20):
+def get_active_projects(limit: int = 20) -> list:
     sql = f"""
     SELECT *
     FROM `{PROJECT_ID}.{DATASET}.projects`
-    WHERE LOWER(CAST(status AS STRING)) NOT IN ('completed', 'closed', 'cancelled')
+    WHERE LOWER(CAST(status AS STRING)) NOT IN ('done', 'completed', 'cancelled', 'closed')
     LIMIT @limit
     """
     return run_query(sql, [bigquery.ScalarQueryParameter("limit", "INT64", limit)])
 
 
-def get_candidate_documents(limit: int = 200):
+def get_candidate_documents(limit: int = 200) -> list:
     sql = f"""
     SELECT *
     FROM `{PROJECT_ID}.{DATASET}.documents`
@@ -236,7 +301,7 @@ def get_project(project_id: str):
     return rows[0] if rows else None
 
 
-def get_project_documents(project_id: str, limit: int = 30):
+def get_project_documents(project_id: str, limit: int = 30) -> list:
     sql = f"""
     SELECT d.*
     FROM `{PROJECT_ID}.{DATASET}.project_document_map` m
@@ -255,72 +320,88 @@ def get_project_documents(project_id: str, limit: int = 30):
 
 # ---------------------------------------------------------------------------
 # SCORO SYNC
-# Reads active projects from Scoro API and upserts them into BigQuery.projects
+# Reads active projects from Scoro API and upserts into BigQuery.projects
+# projects schema: see SCHEMA.md
 # ---------------------------------------------------------------------------
 
 
-def _scoro_headers() -> dict:
-    return {"Content-Type": "application/json", "Accept": "application/json"}
-
-
-def _scoro_body(extra: dict | None = None) -> dict:
-    body: dict = {
-        "apiKey": SCORO_API_KEY,
-        "lang": "eng",
-    }
-    if SCORO_COMPANY_ACCOUNT_ID:
-        body["company_account_id"] = SCORO_COMPANY_ACCOUNT_ID
-    if extra:
-        body.update(extra)
-    return body
-
-
-def fetch_scoro_projects(page: int = 1, per_page: int = 50) -> list[dict]:
-    """Fetch one page of projects from the Scoro v2 API."""
+def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
     if not SCORO_BASE_URL or not SCORO_API_KEY:
         raise RuntimeError("SCORO_BASE_URL and SCORO_API_KEY are required for scoro-sync")
 
-    url = f"{SCORO_BASE_URL}/api/v2/projects/list"
-    body = _scoro_body({
+    body: dict = {"apiKey": SCORO_API_KEY, "lang": "eng"}
+    if SCORO_COMPANY_ACCOUNT_ID:
+        body["company_account_id"] = SCORO_COMPANY_ACCOUNT_ID
+    if body_extra:
+        body.update(body_extra)
+
+    resp = requests.post(
+        f"{SCORO_BASE_URL}/api/v2/{endpoint}",
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        json=body,
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "OK":
+        raise RuntimeError(f"Scoro API error on /{endpoint}: {data.get('messages') or data}")
+    return data
+
+
+def fetch_scoro_projects(page: int = 1, per_page: int = 50) -> list[dict]:
+    data = _scoro_post("projects/list", {
         "page": page,
         "per_page": per_page,
         "filter": {"status": "inprogress"},
     })
-
-    resp = requests.post(url, headers=_scoro_headers(), json=body, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-
-    if not data.get("status") == "OK":
-        raise RuntimeError(f"Scoro API error: {data.get('messages') or data}")
-
     return data.get("data", [])
 
 
+def _safe_date_str(val) -> str | None:
+    """Return an ISO date string or None; BQ SAFE.PARSE_DATE handles the rest."""
+    if not val:
+        return None
+    return str(val)[:10]  # keep only YYYY-MM-DD
+
+
 def normalize_scoro_project(raw: dict) -> dict:
-    """Map a Scoro project object to the BigQuery projects table schema."""
-    owner = raw.get("owner_user", {}) or {}
-    team = raw.get("team_users", []) or []
+    """Map a Scoro project API object to the BigQuery projects table schema."""
+    manager_obj = raw.get("owner_user") or raw.get("project_manager_user") or {}
+    manager_name = (
+        f"{manager_obj.get('firstname', '')} {manager_obj.get('lastname', '')}".strip()
+        or str(raw.get("project_manager", ""))
+    )
+
+    team = raw.get("team_users") or raw.get("project_members_users") or []
     team_names = ", ".join(
         f"{m.get('firstname', '')} {m.get('lastname', '')}".strip()
         for m in team
         if m.get("firstname") or m.get("lastname")
-    )
+    ) or str(raw.get("project_members", ""))
 
     return {
         "project_id": f"scoro_{raw['id']}",
         "scoro_id": str(raw.get("id", "")),
-        "project_code": str(raw.get("no", "") or raw.get("project_code", "")),
-        "project_name": raw.get("name", ""),
-        "client_name": (raw.get("company_name") or raw.get("client_name") or ""),
-        "status": raw.get("status", ""),
-        "project_manager": f"{owner.get('firstname', '')} {owner.get('lastname', '')}".strip(),
-        "team_members": team_names,
-        "start_date": str(raw.get("start_date") or ""),
-        "end_date": str(raw.get("end_date") or raw.get("deadline") or ""),
-        "description": raw.get("description", "") or "",
-        "google_drive_link": raw.get("drive_url") or raw.get("external_url") or "",
-        "synced_at": now_iso(),
+        "project_no": str(raw.get("no", "") or raw.get("project_no", "")),
+        "project_name": str(raw.get("name", "") or raw.get("project_name", "")),
+        "status": str(raw.get("status", "")),
+        "project_manager": manager_name,
+        "project_members": team_names,
+        "start_date": _safe_date_str(raw.get("start_date") or raw.get("date")),
+        "due_date": _safe_date_str(raw.get("due_date") or raw.get("end_date") or raw.get("deadline")),
+        "completed_date": str(raw.get("completed_date") or ""),
+        "description": str(raw.get("description") or ""),
+        "client_company": str(raw.get("company_name") or raw.get("contact_name") or ""),
+        "project_type": str(raw.get("c_projecttype") or ""),
+        "client_country": str(raw.get("c_clientcountry") or ""),
+        "business_area": str(raw.get("c_businessarea") or ""),
+        "business_line_division": str(raw.get("c_businesslinedivision") or ""),
+        "budget_type": str(raw.get("c_budgettype") or raw.get("budget_type") or ""),
+        "po_number": str(raw.get("c_ponumber") or ""),
+        "open_po_number": str(raw.get("c_openponr") or ""),
+        "related_project": str(raw.get("c_relatedproject") or ""),
+        "google_drive_link": str(raw.get("c_drivelink") or raw.get("drive_url") or ""),
+        "project_priority": str(raw.get("c_project_priority") or ""),
     }
 
 
@@ -329,63 +410,85 @@ def upsert_projects(rows: list[dict]):
     if not rows:
         return
 
-    tmp_table = f"{PROJECT_ID}.{DATASET}._tmp_projects_{uuid.uuid4().hex[:8]}"
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_TRUNCATE",
-        autodetect=True,
-    )
-    load_job = bq.load_table_from_json(rows, tmp_table, job_config=job_config)
-    load_job.result()
+    tmp = f"{PROJECT_ID}.{DATASET}._tmp_projects_{uuid.uuid4().hex[:8]}"
+    bq.load_table_from_json(
+        rows, tmp,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True),
+    ).result()
 
     try:
-        merge_sql = f"""
+        bq.query(f"""
         MERGE `{PROJECT_ID}.{DATASET}.projects` T
-        USING `{tmp_table}` S
+        USING `{tmp}` S
         ON T.project_id = S.project_id
         WHEN MATCHED THEN UPDATE SET
-            scoro_id          = S.scoro_id,
-            project_code      = S.project_code,
-            project_name      = S.project_name,
-            client_name       = S.client_name,
-            status            = S.status,
-            project_manager   = S.project_manager,
-            team_members      = S.team_members,
-            start_date        = S.start_date,
-            end_date          = S.end_date,
-            description       = S.description,
-            google_drive_link = S.google_drive_link,
-            synced_at         = S.synced_at
-        WHEN NOT MATCHED THEN INSERT ROW
-        """
-        bq.query(merge_sql).result()
+            scoro_id             = S.scoro_id,
+            project_no           = S.project_no,
+            project_name         = S.project_name,
+            status               = S.status,
+            project_manager      = S.project_manager,
+            project_members      = S.project_members,
+            start_date           = SAFE.PARSE_DATE('%Y-%m-%d', S.start_date),
+            due_date             = SAFE.PARSE_DATE('%Y-%m-%d', S.due_date),
+            completed_date       = S.completed_date,
+            description          = S.description,
+            client_company       = S.client_company,
+            project_type         = S.project_type,
+            client_country       = S.client_country,
+            business_area        = S.business_area,
+            business_line_division = S.business_line_division,
+            budget_type          = S.budget_type,
+            po_number            = S.po_number,
+            open_po_number       = S.open_po_number,
+            related_project      = S.related_project,
+            google_drive_link    = S.google_drive_link,
+            project_priority     = S.project_priority,
+            imported_at          = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN INSERT (
+            project_id, scoro_id, project_no, project_name, status,
+            project_manager, project_members,
+            start_date, due_date, completed_date, description,
+            client_company, project_type, client_country,
+            business_area, business_line_division, budget_type,
+            po_number, open_po_number, related_project,
+            google_drive_link, project_priority, imported_at
+        ) VALUES (
+            S.project_id, S.scoro_id, S.project_no, S.project_name, S.status,
+            S.project_manager, S.project_members,
+            SAFE.PARSE_DATE('%Y-%m-%d', S.start_date),
+            SAFE.PARSE_DATE('%Y-%m-%d', S.due_date),
+            S.completed_date, S.description,
+            S.client_company, S.project_type, S.client_country,
+            S.business_area, S.business_line_division, S.budget_type,
+            S.po_number, S.open_po_number, S.related_project,
+            S.google_drive_link, S.project_priority, CURRENT_TIMESTAMP()
+        )
+        """).result()
     finally:
-        bq.delete_table(tmp_table, not_found_ok=True)
+        bq.delete_table(tmp, not_found_ok=True)
 
 
 def scoro_sync():
     run_id = str(uuid.uuid4())
     started_at = now_iso()
-    total_written = 0
 
     try:
-        page = 1
-        all_projects: list[dict] = []
+        page, all_raw = 1, []
         while True:
             batch = fetch_scoro_projects(page=page, per_page=50)
             if not batch:
                 break
-            all_projects.extend(batch)
+            all_raw.extend(batch)
             if len(batch) < 50:
                 break
             page += 1
 
-        normalized = [normalize_scoro_project(p) for p in all_projects]
+        normalized = [normalize_scoro_project(p) for p in all_raw]
         upsert_projects(normalized)
-        total_written = len(normalized)
 
-        logger.info(json.dumps({"status": "ok", "job": "scoro-sync", "projects_upserted": total_written}))
+        logger.info(json.dumps({"status": "ok", "job": "scoro-sync", "projects_upserted": len(normalized)}))
         log_pipeline_run("scoro-sync", run_id, started_at, "success",
-                         records_read=len(all_projects), records_written=total_written)
+                         records_read=len(all_raw), records_written=len(normalized))
 
     except Exception as e:
         log_pipeline_run("scoro-sync", run_id, started_at, "error", error_message=str(e))
@@ -393,8 +496,8 @@ def scoro_sync():
 
 # ---------------------------------------------------------------------------
 # DOCUMENT DISCOVERY
-# Searches Gemini Enterprise (Discovery Engine) for documents related to each
-# active project and upserts results into BigQuery.documents
+# Searches Discovery Engine per project and upserts into BigQuery.documents
+# documents schema: see SCHEMA.md
 # ---------------------------------------------------------------------------
 
 _gcp_credentials = None
@@ -411,7 +514,6 @@ def _get_access_token() -> str:
 
 
 def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
-    """Call Discovery Engine Search REST API and return raw result items."""
     if not DE_ENGINE_ID:
         raise RuntimeError("DISCOVERY_ENGINE_ENGINE_ID is required for document-discovery")
 
@@ -420,7 +522,6 @@ def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
         f"projects/{DE_PROJECT}/locations/{DE_LOCATION}/collections/{DE_COLLECTION}"
         f"/engines/{DE_ENGINE_ID}/servingConfigs/{DE_SERVING_CONFIG}:search"
     )
-
     resp = requests.post(
         url,
         headers={
@@ -440,10 +541,11 @@ def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
 
 
 def _build_project_query(project) -> str:
+    """Build a search query from project metadata (uses actual projects schema)."""
     parts = [
         _row(project, "project_name"),
-        _row(project, "project_code"),
-        _row(project, "client_name"),
+        _row(project, "project_no"),       # project number / code
+        _row(project, "client_company"),   # client name
     ]
     drive = _row(project, "google_drive_link")
     if drive:
@@ -452,26 +554,21 @@ def _build_project_query(project) -> str:
 
 
 def discover_documents_for_project(project) -> list[dict]:
-    """Search Discovery Engine for documents related to a project."""
     query = _build_project_query(project)
     if not query.strip():
         return []
 
     results = search_discovery_engine(query, page_size=int(os.getenv("DOCUMENT_LIMIT", "20")))
-
     docs = []
     for item in results:
         doc = item.get("document", {})
         derived = doc.get("derivedStructData", {})
         struct = doc.get("structData", {})
-
         document_id = doc.get("id") or doc.get("name", "")
         if not document_id:
             continue
-
         snippets = derived.get("snippets", [])
         snippet = snippets[0].get("snippet", "") if snippets else ""
-
         docs.append({
             "document_id": document_id,
             "source_system": "discovery_engine",
@@ -482,9 +579,7 @@ def discover_documents_for_project(project) -> list[dict]:
             "author": "",
             "text_preview": snippet[:1000],
             "full_text": snippet,
-            "discovered_at": now_iso(),
         })
-
     return docs
 
 
@@ -493,18 +588,16 @@ def upsert_documents(rows: list[dict]):
     if not rows:
         return
 
-    tmp_table = f"{PROJECT_ID}.{DATASET}._tmp_docs_{uuid.uuid4().hex[:8]}"
-    job_config = bigquery.LoadJobConfig(
-        write_disposition="WRITE_TRUNCATE",
-        autodetect=True,
-    )
-    load_job = bq.load_table_from_json(rows, tmp_table, job_config=job_config)
-    load_job.result()
+    tmp = f"{PROJECT_ID}.{DATASET}._tmp_docs_{uuid.uuid4().hex[:8]}"
+    bq.load_table_from_json(
+        rows, tmp,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", autodetect=True),
+    ).result()
 
     try:
-        merge_sql = f"""
+        bq.query(f"""
         MERGE `{PROJECT_ID}.{DATASET}.documents` T
-        USING `{tmp_table}` S
+        USING `{tmp}` S
         ON T.document_id = S.document_id
         WHEN MATCHED THEN UPDATE SET
             source_system = S.source_system,
@@ -513,12 +606,17 @@ def upsert_documents(rows: list[dict]):
             url           = S.url,
             text_preview  = S.text_preview,
             full_text     = S.full_text,
-            discovered_at = S.discovered_at
-        WHEN NOT MATCHED THEN INSERT ROW
-        """
-        bq.query(merge_sql).result()
+            imported_at   = CURRENT_TIMESTAMP()
+        WHEN NOT MATCHED THEN INSERT (
+            document_id, source_system, source_type, title, folder_path,
+            url, author, text_preview, full_text, imported_at
+        ) VALUES (
+            S.document_id, S.source_system, S.source_type, S.title, S.folder_path,
+            S.url, S.author, S.text_preview, S.full_text, CURRENT_TIMESTAMP()
+        )
+        """).result()
     finally:
-        bq.delete_table(tmp_table, not_found_ok=True)
+        bq.delete_table(tmp, not_found_ok=True)
 
 
 def document_discovery():
@@ -528,13 +626,12 @@ def document_discovery():
 
     try:
         projects = get_active_projects(limit=int(os.getenv("PROJECT_LIMIT", "20")))
-
         for project in projects:
-            project_name = _row(project, "project_name") or _row(project, "project_id")
+            name = _row(project, "project_name") or _row(project, "project_id")
             docs = discover_documents_for_project(project)
             upsert_documents(docs)
             total_discovered += len(docs)
-            logger.info("document-discovery: %s → %d documents", project_name, len(docs))
+            logger.info("document-discovery: %s → %d docs", name, len(docs))
 
         logger.info(json.dumps({
             "status": "ok", "job": "document-discovery",
@@ -549,7 +646,8 @@ def document_discovery():
 
 # ---------------------------------------------------------------------------
 # TAXONOMY SYNC
-# Classifies which documents belong to which project using an LLM
+# LLM classifies which documents belong to which project
+# project_document_map schema: see SCHEMA.md
 # ---------------------------------------------------------------------------
 
 
@@ -560,27 +658,28 @@ def classify_documents_for_project(project, documents) -> list[dict]:
         modified_at = _row(doc, "modified_at")
         document_chunks.append({
             "document_id": _row(doc, "document_id"),
-            "filename": _row(doc, "title") or _row(doc, "name") or _row(doc, "filename"),
-            "folder_path": _row(doc, "folder_path") or _row(doc, "path"),
+            "filename": _row(doc, "title"),
+            "folder_path": _row(doc, "folder_path"),
             "author": _row(doc, "author"),
             "created_at": str(created_at) if created_at else None,
             "modified_at": str(modified_at) if modified_at else None,
-            "preview": (_row(doc, "text_preview") or _row(doc, "preview") or "")[:500],
+            "preview": (_row(doc, "text_preview") or "")[:500],
         })
 
-    project_name = _row(project, "project_name") or _row(project, "name")
-    project_code = _row(project, "project_code") or _row(project, "code") or _row(project, "project_id")
-    client_name = _row(project, "client_name") or _row(project, "client")
-    team_members = _row(project, "team_members") or _row(project, "team")
+    # Use actual projects schema field names
+    project_name = _row(project, "project_name")
+    project_no = _row(project, "project_no")
+    client_company = _row(project, "client_company")
+    project_members = _row(project, "project_members")
     start_date = _row(project, "start_date")
-    end_date = _row(project, "end_date")
-    description = _row(project, "description") or _row(project, "summary")
+    due_date = _row(project, "due_date")
+    description = _row(project, "description")
 
     prompt = f"""
 You are a document classifier for Admind Agency, a creative branding studio.
 
-Project: {project_name} | Code: {project_code} | Client: {client_name}
-Team: {team_members} | Period: {start_date} to {end_date}
+Project: {project_name} | No: {project_no} | Client: {client_company}
+Team: {project_members} | Period: {start_date} to {due_date}
 Description: {description}
 
 Below are candidate documents. Return ONLY valid JSON.
@@ -627,7 +726,6 @@ def taxonomy_sync():
 
         for project in projects:
             matches = classify_documents_for_project(project, documents)
-
             rows = [
                 {
                     "project_id": _row(project, "project_id"),
@@ -641,7 +739,6 @@ def taxonomy_sync():
                 for m in matches
                 if m.get("confidence_score", 0) >= 0.75
             ]
-
             insert_rows("project_document_map", rows)
             projects_processed += 1
             mappings_created += len(rows)
@@ -663,7 +760,7 @@ def taxonomy_sync():
 
 # ---------------------------------------------------------------------------
 # WIKI GENERATION
-# Reads matched documents per project and writes a Markdown wiki to Firestore
+# Reads matched documents and writes Markdown wiki pages to Firestore
 # ---------------------------------------------------------------------------
 
 
@@ -687,15 +784,17 @@ def generate_wiki_for_project(project_id: str):
         for doc in docs
     ]
 
-    project_name = _row(project, "project_name") or _row(project, "name")
-    project_code = _row(project, "project_code") or _row(project, "code") or project_id
-    client_name = _row(project, "client_name") or _row(project, "client")
+    # Use actual projects schema field names
+    project_name = _row(project, "project_name")
+    project_no = _row(project, "project_no") or project_id
+    client_company = _row(project, "client_company")
+    project_members = _row(project, "project_members")
 
     prompt = f"""
 You are a technical documentarian for Admind Agency.
 
 Write the internal wiki page for:
-Project: {project_name} ({project_code}) | Client: {client_name}
+Project: {project_name} ({project_no}) | Client: {client_company}
 
 Using ONLY the source documents below, write Markdown with these sections:
 ## Overview
@@ -723,8 +822,9 @@ Source documents:
     db.collection("wiki").document(project_id).set({
         "project_id": project_id,
         "project_name": project_name,
-        "project_code": project_code,
-        "client_name": client_name,
+        "project_no": project_no,
+        "client_company": client_company,
+        "project_members": project_members,
         "markdown": markdown,
         "generated_at": firestore.SERVER_TIMESTAMP,
         "generated_by_model": model_used,
@@ -748,7 +848,7 @@ def wiki_generate_all():
             generate_wiki_for_project(pid)
 
 # ---------------------------------------------------------------------------
-# FULL SYNC  — runs the entire pipeline in order
+# FULL SYNC — runs the complete pipeline in order
 # ---------------------------------------------------------------------------
 
 
@@ -768,10 +868,9 @@ def full_sync():
         try:
             step_fn()
         except Exception as e:
-            logger.error("full-sync: step %s failed: %s", step_name, e)
             log_pipeline_run("full-sync", run_id, started_at, "error",
                              error_message=f"Step {step_name} failed: {str(e)[:800]}")
-            raise
+            raise RuntimeError(f"full-sync failed at step '{step_name}': {e}") from e
 
     log_pipeline_run("full-sync", run_id, started_at, "success")
     logger.info(json.dumps({"status": "ok", "job": "full-sync"}))
@@ -799,12 +898,10 @@ def run_job(job: str):
 
     fn = dispatch.get(job)
     if fn is None:
-        raise RuntimeError(
-            f"Unknown JOB_TYPE '{job}'. Valid values: {', '.join(list(dispatch) + ['wiki-generate-one'])}"
-        )
+        valid = ", ".join(list(dispatch) + ["wiki-generate-one"])
+        raise RuntimeError(f"Unknown JOB_TYPE '{job}'. Valid values: {valid}")
     fn()
 
 
 if __name__ == "__main__":
-    job = os.getenv("JOB_TYPE", "taxonomy-sync")
-    run_job(job)
+    run_job(os.getenv("JOB_TYPE", "taxonomy-sync"))
