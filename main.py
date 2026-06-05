@@ -336,9 +336,9 @@ def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
         )
 
     body: dict = {
-        "apiKey": SCORO_API_KEY,
+        "apiKey": SCORO_API_KEY.strip(),
         "lang": "eng",
-        "company_account_id": SCORO_COMPANY_ACCOUNT_ID,
+        "company_account_id": SCORO_COMPANY_ACCOUNT_ID.strip(),
     }
     if body_extra:
         body.update(body_extra)
