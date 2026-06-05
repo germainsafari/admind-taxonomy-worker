@@ -326,12 +326,20 @@ def get_project_documents(project_id: str, limit: int = 30) -> list:
 
 
 def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
+    """POST to Scoro API v2 with apiKey + company_account_id in the body."""
     if not SCORO_BASE_URL or not SCORO_API_KEY:
         raise RuntimeError("SCORO_BASE_URL and SCORO_API_KEY are required for scoro-sync")
+    if not SCORO_COMPANY_ACCOUNT_ID:
+        raise RuntimeError(
+            "SCORO_COMPANY_ACCOUNT_ID is required. "
+            "Find it in Scoro → Settings → Site settings → General."
+        )
 
-    body: dict = {"apiKey": SCORO_API_KEY, "lang": "eng"}
-    if SCORO_COMPANY_ACCOUNT_ID:
-        body["company_account_id"] = SCORO_COMPANY_ACCOUNT_ID
+    body: dict = {
+        "apiKey": SCORO_API_KEY,
+        "lang": "eng",
+        "company_account_id": SCORO_COMPANY_ACCOUNT_ID,
+    }
     if body_extra:
         body.update(body_extra)
 
@@ -345,19 +353,26 @@ def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
         timeout=60,
     )
 
-    if not resp.ok or not resp.text.strip().startswith("{"):
+    if not resp.ok:
         raise RuntimeError(
-            f"Scoro API unexpected response on /{endpoint}: "
-            f"HTTP {resp.status_code} — {resp.text[:500]}"
+            f"Scoro API HTTP {resp.status_code} on /{endpoint}: {resp.text[:500]}"
         )
 
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(
+            f"Scoro API non-JSON response on /{endpoint}: {resp.text[:500]}"
+        )
+
     if data.get("status") != "OK":
         raise RuntimeError(f"Scoro API error on /{endpoint}: {data.get('messages') or data}")
+
     return data
 
 
 def fetch_scoro_projects(page: int = 1, per_page: int = 50) -> list[dict]:
+    """Fetch one page of active projects from Scoro API v2."""
     data = _scoro_post("projects/list", {
         "page": page,
         "per_page": per_page,
@@ -374,42 +389,33 @@ def _safe_date_str(val) -> str | None:
 
 
 def normalize_scoro_project(raw: dict) -> dict:
-    """Map a Scoro project API object to the BigQuery projects table schema."""
-    manager_obj = raw.get("owner_user") or raw.get("project_manager_user") or {}
-    manager_name = (
-        f"{manager_obj.get('firstname', '')} {manager_obj.get('lastname', '')}".strip()
-        or str(raw.get("project_manager", ""))
-    )
-
-    team = raw.get("team_users") or raw.get("project_members_users") or []
-    team_names = ", ".join(
-        f"{m.get('firstname', '')} {m.get('lastname', '')}".strip()
-        for m in team
-        if m.get("firstname") or m.get("lastname")
-    ) or str(raw.get("project_members", ""))
+    """Map a Scoro API v2 project object to the BigQuery projects table schema."""
+    # v2 uses project_id (not id), project_name (not name), manager_id (not manager object)
+    scoro_id = str(raw.get("project_id") or raw.get("id") or "")
 
     return {
-        "project_id": f"scoro_{raw['id']}",
-        "scoro_id": str(raw.get("id", "")),
-        "project_no": str(raw.get("no", "") or raw.get("project_no", "")),
-        "project_name": str(raw.get("name", "") or raw.get("project_name", "")),
-        "status": str(raw.get("status", "")),
-        "project_manager": manager_name,
-        "project_members": team_names,
-        "start_date": _safe_date_str(raw.get("start_date") or raw.get("date")),
-        "due_date": _safe_date_str(raw.get("due_date") or raw.get("end_date") or raw.get("deadline")),
+        "project_id": f"scoro_{scoro_id}",
+        "scoro_id": scoro_id,
+        "project_no": str(raw.get("no", "") or ""),
+        "project_name": str(raw.get("project_name") or raw.get("name") or ""),
+        "status": str(raw.get("status") or ""),
+        # v2 returns manager_id + manager_email, not a name object
+        "project_manager": str(raw.get("manager_email") or raw.get("manager_id") or ""),
+        "project_members": "",   # not returned in list endpoint; enriched separately if needed
+        "start_date": _safe_date_str(raw.get("date") or raw.get("start_date")),
+        "due_date": _safe_date_str(raw.get("deadline") or raw.get("due_date")),
         "completed_date": str(raw.get("completed_date") or ""),
         "description": str(raw.get("description") or ""),
-        "client_company": str(raw.get("company_name") or raw.get("contact_name") or ""),
-        "project_type": str(raw.get("c_projecttype") or ""),
+        "client_company": str(raw.get("company_name") or ""),
+        "project_type": str(raw.get("project_type") or raw.get("c_projecttype") or ""),
         "client_country": str(raw.get("c_clientcountry") or ""),
         "business_area": str(raw.get("c_businessarea") or ""),
         "business_line_division": str(raw.get("c_businesslinedivision") or ""),
-        "budget_type": str(raw.get("c_budgettype") or raw.get("budget_type") or ""),
+        "budget_type": str(raw.get("budget_type") or raw.get("c_budgettype") or ""),
         "po_number": str(raw.get("c_ponumber") or ""),
         "open_po_number": str(raw.get("c_openponr") or ""),
         "related_project": str(raw.get("c_relatedproject") or ""),
-        "google_drive_link": str(raw.get("c_drivelink") or raw.get("drive_url") or ""),
+        "google_drive_link": str(raw.get("c_drivelink") or ""),
         "project_priority": str(raw.get("c_project_priority") or ""),
     }
 
