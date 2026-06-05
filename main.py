@@ -549,23 +549,31 @@ def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
         f"projects/{DE_PROJECT}/locations/{DE_LOCATION}/collections/{DE_COLLECTION}"
         f"/engines/{DE_ENGINE_ID}/servingConfigs/{DE_SERVING_CONFIG}:search"
     )
+    payload = {
+        "query": query,
+        "pageSize": page_size,
+        "spellCorrectionSpec": {"mode": "AUTO"},
+        "languageCode": "en-US",
+        "contentSearchSpec": {"snippetSpec": {"returnSnippet": True}},
+    }
+
     resp = requests.post(
         url,
         headers={
             "Authorization": f"Bearer {_get_access_token()}",
             "Content-Type": "application/json",
         },
-        json={
-            "query": query,
-            "pageSize": page_size,
-            "spellCorrectionSpec": {"mode": "AUTO"},
-            "languageCode": "en-US",
-            "relevanceScoreSpec": {"returnRelevanceScore": True},
-            "contentSearchSpec": {"snippetSpec": {"returnSnippet": True}},
-        },
+        json=payload,
         timeout=60,
     )
-    resp.raise_for_status()
+
+    if not resp.ok:
+        # Surface the actual API error message instead of a generic HTTPError
+        raise RuntimeError(
+            f"Discovery Engine search failed: HTTP {resp.status_code} — {resp.text[:800]} "
+            f"(query={query!r})"
+        )
+
     return resp.json().get("results", [])
 
 
@@ -661,12 +669,21 @@ def document_discovery():
 
     try:
         projects = get_active_projects(limit=int(os.getenv("PROJECT_LIMIT", "20")))
+        failures = 0
         for project in projects:
             name = _row(project, "project_name") or _row(project, "project_id")
-            docs = discover_documents_for_project(project)
-            upsert_documents(docs)
-            total_discovered += len(docs)
-            logger.info("document-discovery: %s → %d docs", name, len(docs))
+            try:
+                docs = discover_documents_for_project(project)
+                upsert_documents(docs)
+                total_discovered += len(docs)
+                logger.info("document-discovery: %s → %d docs", name, len(docs))
+            except Exception as e:
+                failures += 1
+                logger.error("document-discovery: project %s failed: %s", name, e)
+
+        if total_discovered == 0 and failures > 0:
+            # Every project failed — surface the problem instead of reporting success
+            raise RuntimeError(f"document-discovery: all {failures} project searches failed")
 
         logger.info(json.dumps({
             "status": "ok", "job": "document-discovery",
