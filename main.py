@@ -9,6 +9,7 @@ Pipeline: Scoro → BigQuery.projects
 import json
 import logging
 import os
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -50,6 +51,9 @@ DE_LOCATION = os.getenv("DISCOVERY_ENGINE_LOCATION", "global")
 DE_COLLECTION = os.getenv("DISCOVERY_ENGINE_COLLECTION", "default_collection")
 DE_ENGINE_ID = os.getenv("DISCOVERY_ENGINE_ENGINE_ID", "")
 DE_SERVING_CONFIG = os.getenv("DISCOVERY_ENGINE_SERVING_CONFIG", "default_search")
+# Workspace (Google Drive) data stores reject service-account search. When set,
+# the worker impersonates this licensed Workspace user via domain-wide delegation.
+DISCOVERY_IMPERSONATE_USER = os.getenv("DISCOVERY_IMPERSONATE_USER", "").strip()
 
 # ---------------------------------------------------------------------------
 # GCP clients
@@ -528,16 +532,134 @@ def scoro_sync():
 # ---------------------------------------------------------------------------
 
 _gcp_credentials = None
+_runtime_sa_email = None
+_impersonated_token = None
+_impersonated_token_exp = 0
+
+CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+
+
+def _get_adc_token() -> str:
+    """Plain Application Default Credentials token (the attached service account)."""
+    global _gcp_credentials
+    if _gcp_credentials is None:
+        _gcp_credentials, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
+    _gcp_credentials.refresh(GoogleAuthRequest())
+    return _gcp_credentials.token
+
+
+def _runtime_service_account_email() -> str:
+    """Resolve the email of the service account this job runs as."""
+    global _runtime_sa_email
+    if _runtime_sa_email:
+        return _runtime_sa_email
+
+    # Try the GCE/Cloud Run metadata server first
+    try:
+        resp = requests.get(
+            "http://metadata.google.internal/computeMetadata/v1/"
+            "instance/service-accounts/default/email",
+            headers={"Metadata-Flavor": "Google"},
+            timeout=5,
+        )
+        if resp.ok and resp.text.strip():
+            _runtime_sa_email = resp.text.strip()
+            return _runtime_sa_email
+    except Exception as e:
+        logger.warning("Could not read SA email from metadata server: %s", e)
+
+    # Fall back to credentials property
+    creds, _ = google.auth.default(scopes=[CLOUD_PLATFORM_SCOPE])
+    email = getattr(creds, "service_account_email", None)
+    if not email or email == "default":
+        raise RuntimeError(
+            "Could not determine the runtime service account email for impersonation"
+        )
+    _runtime_sa_email = email
+    return _runtime_sa_email
+
+
+def _get_impersonated_token(user_email: str) -> str:
+    """
+    Mint an access token that acts as `user_email` via domain-wide delegation,
+    WITHOUT a service-account key file. Uses the IAM Credentials signJwt API.
+
+    Prerequisites:
+      1. The runtime service account has roles/iam.serviceAccountTokenCreator on itself.
+      2. A Workspace Super Admin authorized the SA's client ID for the
+         cloud-platform scope under Admin Console → Security → API Controls →
+         Domain-wide Delegation.
+    """
+    global _impersonated_token, _impersonated_token_exp
+
+    now = int(time.time())
+    if _impersonated_token and now < _impersonated_token_exp - 60:
+        return _impersonated_token
+
+    sa_email = _runtime_service_account_email()
+
+    # 1. Build the JWT asserting the impersonated subject
+    claims = {
+        "iss": sa_email,
+        "sub": user_email,
+        "scope": CLOUD_PLATFORM_SCOPE,
+        "aud": "https://oauth2.googleapis.com/token",
+        "iat": now,
+        "exp": now + 3600,
+    }
+
+    # 2. Sign it via the IAM Credentials API (uses the SA's own ADC token)
+    sign_url = (
+        f"https://iamcredentials.googleapis.com/v1/"
+        f"projects/-/serviceAccounts/{sa_email}:signJwt"
+    )
+    sign_resp = requests.post(
+        sign_url,
+        headers={
+            "Authorization": f"Bearer {_get_adc_token()}",
+            "Content-Type": "application/json",
+        },
+        json={"payload": json.dumps(claims)},
+        timeout=30,
+    )
+    if not sign_resp.ok:
+        raise RuntimeError(
+            f"signJwt failed (HTTP {sign_resp.status_code}): {sign_resp.text[:500]}. "
+            f"Ensure {sa_email} has roles/iam.serviceAccountTokenCreator on itself."
+        )
+    signed_jwt = sign_resp.json()["signedJwt"]
+
+    # 3. Exchange the signed JWT for an access token
+    token_resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            "assertion": signed_jwt,
+        },
+        timeout=30,
+    )
+    if not token_resp.ok:
+        raise RuntimeError(
+            f"Token exchange failed (HTTP {token_resp.status_code}): {token_resp.text[:500]}. "
+            f"Ensure domain-wide delegation is authorized for the SA client ID "
+            f"with scope {CLOUD_PLATFORM_SCOPE}."
+        )
+
+    data = token_resp.json()
+    _impersonated_token = data["access_token"]
+    _impersonated_token_exp = now + int(data.get("expires_in", 3600))
+    return _impersonated_token
 
 
 def _get_access_token() -> str:
-    global _gcp_credentials
-    if _gcp_credentials is None:
-        _gcp_credentials, _ = google.auth.default(
-            scopes=["https://www.googleapis.com/auth/cloud-platform"]
-        )
-    _gcp_credentials.refresh(GoogleAuthRequest())
-    return _gcp_credentials.token
+    """
+    Return the token used for Discovery Engine search.
+    If DISCOVERY_IMPERSONATE_USER is set, impersonate that Workspace user
+    (required for Google Drive / Workspace data stores). Otherwise use ADC.
+    """
+    if DISCOVERY_IMPERSONATE_USER:
+        return _get_impersonated_token(DISCOVERY_IMPERSONATE_USER)
+    return _get_adc_token()
 
 
 def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
