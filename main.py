@@ -558,8 +558,10 @@ def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
         json={
             "query": query,
             "pageSize": page_size,
-            "queryExpansionSpec": {"condition": "AUTO"},
             "spellCorrectionSpec": {"mode": "AUTO"},
+            "languageCode": "en-US",
+            "relevanceScoreSpec": {"returnRelevanceScore": True},
+            "contentSearchSpec": {"snippetSpec": {"returnSnippet": True}},
         },
         timeout=60,
     )
