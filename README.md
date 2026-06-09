@@ -40,10 +40,11 @@ Set `JOB_TYPE` to select which step runs:
 |----------|-------------|
 | `scoro-sync` | Fetch active projects from Scoro API v2 and upsert into `BigQuery.projects` |
 | `document-discovery` | Search Gemini Enterprise per project and upsert results into `BigQuery.documents` |
-| `taxonomy-sync` | LLM classifies which documents belong to which project → `project_document_map` |
-| `wiki-generate` | Generate Markdown wiki for all active projects → Firestore `wiki` collection |
+| `taxonomy-sync` | LLM classifies each project's **own** candidate documents → `project_document_map` |
+| `wiki-generate` | Generate Markdown wiki **only for projects with mapped documents** → Firestore `wiki` |
 | `wiki-generate-one` | Generate wiki for a single project (requires `PROJECT_ID_TO_GENERATE`) |
-| `full-sync` | Runs all four steps in order (use for nightly scheduling) |
+| `full-sync` | Runs all four steps in order over **active** projects (use for nightly scheduling) |
+| `historical-full-sync` | Same pipeline but over **all** projects incl. completed (backfill; sets `PROJECT_MODE=all`, `SCORO_PROJECT_MODE=all`) |
 
 ## Requirements
 
@@ -138,7 +139,10 @@ Copy [.env.example](.env.example) for local development. Cloud Run uses env vars
 | `DISCOVERY_ENGINE_SERVING_CONFIG` | `default_search` | Serving config |
 | `DISCOVERY_IMPERSONATE_USER` | — | Licensed Workspace user for Drive search |
 | `PROJECT_LIMIT` | `20` | Max projects per run |
-| `DOCUMENT_LIMIT` | `200` | Max documents per search / load |
+| `DOCUMENT_LIMIT` | `25` | Discovery Engine page size per search query |
+| `CANDIDATE_LIMIT` | `50` | Max per-project candidate docs the classifier sees |
+| `PROJECT_MODE` | `active` | Which projects to process: `active` or `all` |
+| `SCORO_PROJECT_MODE` | `active` | Which projects to fetch from Scoro: `active` (inprogress) or `all` |
 | `PROJECT_ID_TO_GENERATE` | — | Required for `wiki-generate-one` |
 
 ## Local development
@@ -284,6 +288,7 @@ if doc.exists:
 |-------|------|
 | `projects` | Clean project records (from Scoro) |
 | `documents` | Discovered documents (from Discovery Engine) |
+| `project_document_candidates` | Per-project discovery candidates (preserves project → document link) |
 | `project_document_map` | LLM-classified project ↔ document links |
 | `pipeline_runs` | Append-only job execution log |
 | `project_raw` | Legacy raw Scoro export (not written by this worker) |
@@ -307,17 +312,52 @@ Classification matches with confidence below **0.75** are excluded from `project
 └── README.md
 ```
 
-## Scheduling (optional)
+## Scheduling
 
-After `full-sync` passes reliably, schedule nightly:
+Cloud Run Jobs are triggered on a schedule via **Cloud Scheduler**. Set the job's
+default env vars first, grant the scheduler identity `run.invoker`, then create the
+schedule.
 
 ```bash
-gcloud scheduler jobs create http taxonomy-full-sync \
+# 1. Set nightly defaults on the job
+gcloud run jobs update admind-taxonomy-worker \
+  --region europe-west1 \
+  --update-env-vars JOB_TYPE=full-sync,PROJECT_MODE=active,SCORO_PROJECT_MODE=active,PROJECT_LIMIT=20,DOCUMENT_LIMIT=25,CANDIDATE_LIMIT=50
+
+# 2. Allow the service account to run the job
+gcloud run jobs add-iam-policy-binding admind-taxonomy-worker \
+  --region europe-west1 \
+  --member="serviceAccount:project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com" \
+  --role="roles/run.invoker"
+
+# 3. Nightly active sync at 02:00 Europe/Warsaw
+gcloud scheduler jobs create http admind-taxonomy-worker-nightly \
+  --location europe-west1 \
   --schedule "0 2 * * *" \
-  --uri "https://europe-west1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/admind-data-organisation/jobs/admind-taxonomy-worker:run" \
+  --time-zone "Europe/Warsaw" \
+  --uri "https://run.googleapis.com/v2/projects/admind-data-organisation/locations/europe-west1/jobs/admind-taxonomy-worker:run" \
   --http-method POST \
-  --oauth-service-account-email project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com \
-  --location europe-west1
+  --oauth-service-account-email project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com
 ```
 
-Ensure the job's default `JOB_TYPE` is `full-sync` before scheduling.
+Optional **weekly historical backfill** (Sundays 03:00). Because the scheduler
+overrides the container args, pass the job type via an override:
+
+```bash
+gcloud scheduler jobs create http admind-taxonomy-worker-weekly-backfill \
+  --location europe-west1 \
+  --schedule "0 3 * * 0" \
+  --time-zone "Europe/Warsaw" \
+  --uri "https://run.googleapis.com/v2/projects/admind-data-organisation/locations/europe-west1/jobs/admind-taxonomy-worker:run" \
+  --http-method POST \
+  --oauth-service-account-email project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com \
+  --headers "Content-Type=application/json" \
+  --message-body '{"overrides":{"containerOverrides":[{"env":[{"name":"JOB_TYPE","value":"historical-full-sync"}]}]}}'
+```
+
+Test and verify:
+
+```bash
+gcloud scheduler jobs run admind-taxonomy-worker-nightly --location europe-west1
+gcloud run jobs executions list --job admind-taxonomy-worker --region europe-west1
+```

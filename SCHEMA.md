@@ -111,7 +111,8 @@ Candidate documents discovered from Discovery Engine / Gemini Enterprise via `do
 | `source_type` | STRING | e.g. `search_result` |
 | `title` | STRING | Document title |
 | `folder_path` | STRING | Folder path if available |
-| `url` | STRING | Link to the document |
+| `url` | STRING | Link to the document (may be an internal `gs://` connector URI) |
+| `source_url` | STRING | User-facing source link (Drive/SharePoint) when provided by Discovery Engine |
 | `author` | STRING | Author if available |
 | `created_at` | TIMESTAMP | Document creation time |
 | `modified_at` | TIMESTAMP | Last modified time |
@@ -144,6 +145,45 @@ Project-level source links (Drive folders, Slack channels, etc.). Manually manag
 | `matching_method` | STRING | |
 | `needs_human_review` | BOOLEAN | |
 | `imported_at` | TIMESTAMP | |
+
+---
+
+## project_document_candidates
+
+Per-project document candidates returned by Discovery Engine, written by
+`document-discovery`. This table preserves the **project → document** link so
+`taxonomy-sync` classifies each project against *its own* candidates instead of a
+global random pool. Auto-created by the worker (`ensure_schema()`); the DDL below
+is for reference.
+
+```sql
+CREATE TABLE IF NOT EXISTS
+  `admind-data-organisation.admind_data_organisation.project_document_candidates` (
+    project_id      STRING,
+    document_id     STRING,
+    discovery_query STRING,
+    rank            INT64,
+    title           STRING,
+    url             STRING,
+    source_url      STRING,
+    text_preview    STRING,
+    discovered_at   TIMESTAMP,
+    run_id          STRING
+  );
+```
+
+| Field | Type | Notes |
+|---|---|---|
+| `project_id` | STRING | FK → projects.project_id |
+| `document_id` | STRING | FK → documents.document_id |
+| `discovery_query` | STRING | The search query that surfaced this candidate |
+| `rank` | INT64 | Discovery rank (lower = higher relevance) |
+| `title` | STRING | Document title |
+| `url` | STRING | Link (may be internal `gs://`) |
+| `source_url` | STRING | User-facing source link when available |
+| `text_preview` | STRING | Short excerpt |
+| `discovered_at` | TIMESTAMP | When discovered |
+| `run_id` | STRING | FK → pipeline_runs.run_id |
 
 ---
 
@@ -238,7 +278,9 @@ projects (project_id)
     │
     ├─── source_items (project_id)
     │
-    └─── project_document_map (project_id)
-              │
-              └─── documents (document_id)
+    ├─── project_document_candidates (project_id) ──── documents (document_id)
+    │         (discovery output, per-project)
+    │
+    └─── project_document_map (project_id) ──── documents (document_id)
+              (LLM-confirmed, per-project)
 ```

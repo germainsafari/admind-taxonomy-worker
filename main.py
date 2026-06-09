@@ -239,6 +239,44 @@ def insert_rows(table_name: str, rows: list[dict]):
         raise RuntimeError(f"BigQuery insert errors for {table_name}: {errors}")
 
 
+_schema_ready = False
+
+
+def ensure_schema():
+    """
+    Idempotent DDL run once per process. Creates the per-project candidate
+    table and adds the source_url column to documents. Both use IF NOT EXISTS
+    so this is safe to call repeatedly and on every deploy.
+    """
+    global _schema_ready
+    if _schema_ready:
+        return
+
+    bq.query(f"""
+    CREATE TABLE IF NOT EXISTS `{PROJECT_ID}.{DATASET}.project_document_candidates` (
+        project_id      STRING,
+        document_id     STRING,
+        discovery_query STRING,
+        rank            INT64,
+        title           STRING,
+        url             STRING,
+        source_url      STRING,
+        text_preview    STRING,
+        discovered_at   TIMESTAMP,
+        run_id          STRING
+    )
+    """).result()
+
+    # documents.source_url holds the user-facing link (Drive/SharePoint) while
+    # documents.url may be an internal gs:// connector URI.
+    bq.query(f"""
+    ALTER TABLE `{PROJECT_ID}.{DATASET}.documents`
+    ADD COLUMN IF NOT EXISTS source_url STRING
+    """).result()
+
+    _schema_ready = True
+
+
 def _row(row, field: str, default=""):
     """Safely read a field from a BigQuery row; returns default if the column is absent."""
     try:
@@ -278,20 +316,71 @@ def log_pipeline_run(
 # ---------------------------------------------------------------------------
 
 
+def _project_mode() -> str:
+    """active → only open projects; all → every project incl. completed."""
+    return os.getenv("PROJECT_MODE", "active").lower()
+
+
 def get_active_projects(limit: int = 20) -> list:
     sql = f"""
     SELECT *
     FROM `{PROJECT_ID}.{DATASET}.projects`
     WHERE LOWER(CAST(status AS STRING)) NOT IN ('done', 'completed', 'cancelled', 'closed')
+    ORDER BY start_date DESC
     LIMIT @limit
     """
     return run_query(sql, [bigquery.ScalarQueryParameter("limit", "INT64", limit)])
 
 
-def get_candidate_documents(limit: int = 200) -> list:
+def get_all_projects(limit: int = 500) -> list:
     sql = f"""
     SELECT *
-    FROM `{PROJECT_ID}.{DATASET}.documents`
+    FROM `{PROJECT_ID}.{DATASET}.projects`
+    ORDER BY start_date DESC
+    LIMIT @limit
+    """
+    return run_query(sql, [bigquery.ScalarQueryParameter("limit", "INT64", limit)])
+
+
+def get_projects_for_processing(limit: int = 20) -> list:
+    """Pick the project set based on PROJECT_MODE (active vs all)."""
+    if _project_mode() == "all":
+        return get_all_projects(limit=limit)
+    return get_active_projects(limit=limit)
+
+
+def get_candidate_documents_for_project(project_id: str, limit: int = 50) -> list:
+    """
+    Return ONLY the documents Discovery Engine surfaced for this specific project,
+    ordered by discovery rank. This replaces the old global-pool approach that
+    classified every project against the same random documents.
+    """
+    sql = f"""
+    SELECT d.*, c.rank AS candidate_rank, c.discovery_query AS candidate_query
+    FROM `{PROJECT_ID}.{DATASET}.project_document_candidates` c
+    JOIN `{PROJECT_ID}.{DATASET}.documents` d
+      ON c.document_id = d.document_id
+    WHERE c.project_id = @project_id
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY d.document_id ORDER BY c.rank ASC) = 1
+    ORDER BY c.rank ASC
+    LIMIT @limit
+    """
+    return run_query(
+        sql,
+        [
+            bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+            bigquery.ScalarQueryParameter("limit", "INT64", limit),
+        ],
+    )
+
+
+def get_project_ids_with_mapped_documents(limit: int = 20) -> list:
+    sql = f"""
+    SELECT project_id, COUNT(*) AS mapped_document_count
+    FROM `{PROJECT_ID}.{DATASET}.project_document_map`
+    GROUP BY project_id
+    HAVING mapped_document_count > 0
+    ORDER BY mapped_document_count DESC
     LIMIT @limit
     """
     return run_query(sql, [bigquery.ScalarQueryParameter("limit", "INT64", limit)])
@@ -311,6 +400,9 @@ def get_project_documents(project_id: str, limit: int = 30) -> list:
     FROM `{PROJECT_ID}.{DATASET}.project_document_map` m
     JOIN `{PROJECT_ID}.{DATASET}.documents` d ON m.document_id = d.document_id
     WHERE m.project_id = @project_id
+    QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY d.document_id ORDER BY m.confidence_score DESC
+    ) = 1
     ORDER BY m.confidence_score DESC
     LIMIT @limit
     """
@@ -376,12 +468,18 @@ def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
 
 
 def fetch_scoro_projects(page: int = 1, per_page: int = 50) -> list[dict]:
-    """Fetch one page of active projects from Scoro API v2."""
-    data = _scoro_post("projects/list", {
-        "page": page,
-        "per_page": per_page,
-        "filter": {"status": "inprogress"},
-    })
+    """
+    Fetch one page of projects from Scoro API v2.
+
+    SCORO_PROJECT_MODE=active (default) → only status=inprogress (matches the
+    old behaviour). SCORO_PROJECT_MODE=all → no status filter, so completed,
+    cancelled and archived projects are returned too (use for backfill).
+    """
+    body: dict = {"page": page, "per_page": per_page}
+    if os.getenv("SCORO_PROJECT_MODE", "active").lower() == "active":
+        body["filter"] = {"status": "inprogress"}
+
+    data = _scoro_post("projects/list", body)
     return data.get("data", [])
 
 
@@ -676,7 +774,16 @@ def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
         "pageSize": page_size,
         "spellCorrectionSpec": {"mode": "AUTO"},
         "languageCode": "en-US",
-        "contentSearchSpec": {"snippetSpec": {"returnSnippet": True}},
+        "contentSearchSpec": {
+            "snippetSpec": {"returnSnippet": True},
+            # Extractive content gives far richer text than a single snippet,
+            # which is what made the generated wikis shallow.
+            "extractiveContentSpec": {
+                "maxExtractiveAnswerCount": 3,
+                "maxExtractiveSegmentCount": 3,
+                "returnExtractiveSegmentScore": True,
+            },
+        },
     }
 
     resp = requests.post(
@@ -699,47 +806,140 @@ def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
     return resp.json().get("results", [])
 
 
-def _build_project_query(project) -> str:
-    """Build a search query from project metadata (uses actual projects schema)."""
-    parts = [
-        _row(project, "project_name"),
-        _row(project, "project_no"),       # project number / code
-        _row(project, "client_company"),   # client name
-    ]
+def build_project_queries(project) -> list[str]:
+    """
+    Build several complementary search queries per project. Discovery Engine is
+    search-based, so multiple angles (name+number, client+type, cleaned name,
+    drive link) retrieve far more relevant candidates than one combined string.
+    """
+    project_name = _row(project, "project_name")
+    project_no = _row(project, "project_no")
+    client = _row(project, "client_company")
+    project_type = _row(project, "project_type")
+    business_area = _row(project, "business_area")
+    description = _row(project, "description")
     drive = _row(project, "google_drive_link")
+
+    queries: list[str] = []
+
+    if project_name and project_no:
+        queries.append(f'"{project_name}" "{project_no}"')
+    if client and project_type:
+        queries.append(" ".join(p for p in [client, project_type, business_area] if p))
+    if project_name:
+        queries.append(project_name.replace("_", " "))
+    if client and description:
+        queries.append(f"{client} {description[:200]}")
     if drive:
-        parts.append(drive)
-    return " ".join(p for p in parts if p)
+        queries.append(drive)
+
+    # Deduplicate while preserving order.
+    seen, unique = set(), []
+    for q in queries:
+        q = q.strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            unique.append(q)
+    return unique
 
 
-def discover_documents_for_project(project) -> list[dict]:
-    query = _build_project_query(project)
-    if not query.strip():
-        return []
+def _extract_document(item: dict) -> dict | None:
+    """Parse one Discovery Engine search result into a documents row."""
+    doc = item.get("document", {})
+    derived = doc.get("derivedStructData", {})
+    struct = doc.get("structData", {})
+    document_id = doc.get("id") or doc.get("name", "")
+    if not document_id:
+        return None
 
-    results = search_discovery_engine(query, page_size=int(os.getenv("DOCUMENT_LIMIT", "20")))
-    docs = []
-    for item in results:
-        doc = item.get("document", {})
-        derived = doc.get("derivedStructData", {})
-        struct = doc.get("structData", {})
-        document_id = doc.get("id") or doc.get("name", "")
-        if not document_id:
+    parts: list[str] = []
+
+    snippets = derived.get("snippets", []) or []
+    snippet = snippets[0].get("snippet", "") if snippets else ""
+    if snippet:
+        parts.append(snippet)
+
+    for ans in derived.get("extractive_answers", []) or derived.get("extractiveAnswers", []) or []:
+        content = ans.get("content") or ans.get("pageContent")
+        if content:
+            parts.append(content)
+
+    for seg in derived.get("extractive_segments", []) or derived.get("extractiveSegments", []) or []:
+        content = seg.get("content") or seg.get("pageContent")
+        if content:
+            parts.append(content)
+
+    full_text = "\n\n".join(parts)
+
+    # url may be an internal gs:// connector URI; source_url is the user-facing
+    # link when Discovery Engine provides one.
+    source_url = (
+        derived.get("link")
+        or struct.get("link")
+        or struct.get("url")
+        or struct.get("source_url")
+        or ""
+    )
+    url = source_url or struct.get("uri") or doc.get("name", "") or ""
+
+    return {
+        "document_id": document_id,
+        "source_system": "discovery_engine",
+        "source_type": "search_result",
+        "title": derived.get("title") or struct.get("title") or document_id,
+        "folder_path": "",
+        "url": url,
+        "source_url": source_url,
+        "author": "",
+        "text_preview": (snippet or full_text)[:1000],
+        "full_text": full_text[:12000],
+    }
+
+
+def discover_documents_for_project(project) -> tuple[list[dict], list[dict]]:
+    """
+    Returns (documents, candidates).
+    documents  → rows for the global documents table (deduped by document_id).
+    candidates → per-project link rows (project_id, document_id, rank, query…).
+    """
+    queries = build_project_queries(project)
+    if not queries:
+        return [], []
+
+    project_id = _row(project, "project_id")
+    page_size = int(os.getenv("DOCUMENT_LIMIT", "25"))
+
+    docs_by_id: dict[str, dict] = {}
+    candidates: list[dict] = []
+    rank = 0
+
+    for query in queries:
+        try:
+            results = search_discovery_engine(query, page_size=page_size)
+        except Exception as e:
+            logger.warning("document-discovery: query failed (%s): %s", query, e)
             continue
-        snippets = derived.get("snippets", [])
-        snippet = snippets[0].get("snippet", "") if snippets else ""
-        docs.append({
-            "document_id": document_id,
-            "source_system": "discovery_engine",
-            "source_type": "search_result",
-            "title": derived.get("title") or struct.get("title") or document_id,
-            "folder_path": "",
-            "url": derived.get("link") or struct.get("uri") or struct.get("url") or "",
-            "author": "",
-            "text_preview": snippet[:1000],
-            "full_text": snippet,
-        })
-    return docs
+
+        for item in results:
+            parsed = _extract_document(item)
+            if not parsed:
+                continue
+            doc_id = parsed["document_id"]
+            docs_by_id.setdefault(doc_id, parsed)
+            rank += 1
+            candidates.append({
+                "project_id": project_id,
+                "document_id": doc_id,
+                "discovery_query": query,
+                "rank": rank,
+                "title": parsed["title"],
+                "url": parsed["url"],
+                "source_url": parsed["source_url"],
+                "text_preview": parsed["text_preview"],
+                "discovered_at": now_iso(),
+            })
+
+    return list(docs_by_id.values()), candidates
 
 
 def upsert_documents(rows: list[dict]):
@@ -749,9 +949,10 @@ def upsert_documents(rows: list[dict]):
 
     string_fields = [
         "document_id", "source_system", "source_type", "title", "folder_path",
-        "url", "author", "text_preview", "full_text",
+        "url", "source_url", "author", "text_preview", "full_text",
     ]
     schema = [bigquery.SchemaField(f, "STRING") for f in string_fields]
+    rows = [{f: r.get(f, "") for f in string_fields} for r in rows]
 
     tmp = f"{PROJECT_ID}.{DATASET}._tmp_docs_{uuid.uuid4().hex[:8]}"
     bq.load_table_from_json(
@@ -769,15 +970,68 @@ def upsert_documents(rows: list[dict]):
             source_type   = S.source_type,
             title         = S.title,
             url           = S.url,
+            source_url    = S.source_url,
             text_preview  = S.text_preview,
             full_text     = S.full_text,
             imported_at   = CURRENT_TIMESTAMP()
         WHEN NOT MATCHED THEN INSERT (
             document_id, source_system, source_type, title, folder_path,
-            url, author, text_preview, full_text, imported_at
+            url, source_url, author, text_preview, full_text, imported_at
         ) VALUES (
             S.document_id, S.source_system, S.source_type, S.title, S.folder_path,
-            S.url, S.author, S.text_preview, S.full_text, CURRENT_TIMESTAMP()
+            S.url, S.source_url, S.author, S.text_preview, S.full_text, CURRENT_TIMESTAMP()
+        )
+        """).result()
+    finally:
+        bq.delete_table(tmp, not_found_ok=True)
+
+
+def upsert_document_candidates(rows: list[dict], run_id: str):
+    """MERGE per-project discovery candidates (idempotent on project+document)."""
+    if not rows:
+        return
+
+    string_fields = ["project_id", "document_id", "discovery_query", "title",
+                     "url", "source_url", "text_preview"]
+    schema = [bigquery.SchemaField(f, "STRING") for f in string_fields]
+    schema.append(bigquery.SchemaField("rank", "INT64"))
+    schema.append(bigquery.SchemaField("discovered_at", "TIMESTAMP"))
+    schema.append(bigquery.SchemaField("run_id", "STRING"))
+
+    payload = []
+    for r in rows:
+        row = {f: r.get(f, "") for f in string_fields}
+        row["rank"] = int(r.get("rank", 0))
+        row["discovered_at"] = r.get("discovered_at") or now_iso()
+        row["run_id"] = run_id
+        payload.append(row)
+
+    tmp = f"{PROJECT_ID}.{DATASET}._tmp_cand_{uuid.uuid4().hex[:8]}"
+    bq.load_table_from_json(
+        payload, tmp,
+        job_config=bigquery.LoadJobConfig(write_disposition="WRITE_TRUNCATE", schema=schema),
+    ).result()
+
+    try:
+        bq.query(f"""
+        MERGE `{PROJECT_ID}.{DATASET}.project_document_candidates` T
+        USING `{tmp}` S
+        ON T.project_id = S.project_id AND T.document_id = S.document_id
+        WHEN MATCHED THEN UPDATE SET
+            discovery_query = S.discovery_query,
+            rank            = S.rank,
+            title           = S.title,
+            url             = S.url,
+            source_url      = S.source_url,
+            text_preview    = S.text_preview,
+            discovered_at   = S.discovered_at,
+            run_id          = S.run_id
+        WHEN NOT MATCHED THEN INSERT (
+            project_id, document_id, discovery_query, rank, title, url,
+            source_url, text_preview, discovered_at, run_id
+        ) VALUES (
+            S.project_id, S.document_id, S.discovery_query, S.rank, S.title, S.url,
+            S.source_url, S.text_preview, S.discovered_at, S.run_id
         )
         """).result()
     finally:
@@ -790,15 +1044,18 @@ def document_discovery():
     total_discovered = 0
 
     try:
-        projects = get_active_projects(limit=int(os.getenv("PROJECT_LIMIT", "20")))
+        ensure_schema()
+        projects = get_projects_for_processing(limit=int(os.getenv("PROJECT_LIMIT", "20")))
         failures = 0
         for project in projects:
             name = _row(project, "project_name") or _row(project, "project_id")
             try:
-                docs = discover_documents_for_project(project)
+                docs, candidates = discover_documents_for_project(project)
                 upsert_documents(docs)
-                total_discovered += len(docs)
-                logger.info("document-discovery: %s → %d docs", name, len(docs))
+                upsert_document_candidates(candidates, run_id)
+                total_discovered += len(candidates)
+                logger.info("document-discovery: %s → %d docs / %d candidates",
+                            name, len(docs), len(candidates))
             except Exception as e:
                 failures += 1
                 logger.error("document-discovery: project %s failed: %s", name, e)
@@ -849,30 +1106,48 @@ def classify_documents_for_project(project, documents) -> list[dict]:
     due_date = _row(project, "due_date")
     description = _row(project, "description")
 
+    project_type = _row(project, "project_type")
+    business_area = _row(project, "business_area")
+
     prompt = f"""
-You are a document classifier for Admind Agency, a creative branding studio.
+You are a project-document taxonomy classifier for Admind Agency, a creative branding studio.
+Decide whether each candidate document belongs to the project below.
 
-Project: {project_name} | No: {project_no} | Client: {client_company}
-Team: {project_members} | Period: {start_date} to {due_date}
-Description: {description}
+Project metadata:
+- Project number: {project_no}
+- Project name: {project_name}
+- Client/company: {client_company}
+- Project type: {project_type}
+- Business area: {business_area}
+- Team: {project_members}
+- Period: {start_date} to {due_date}
+- Description: {description}
 
-Below are candidate documents. Return ONLY valid JSON.
+Classification rules:
+- strong_match: title/path/content clearly references this project, its number,
+  client, campaign, or a specific deliverable/workstream.
+- possible_match: appears related to the same client or workstream but evidence
+  is incomplete.
+- reject: generic, unrelated, or only weakly matching.
 
-Return a JSON object with this exact shape:
+Guidance:
+- Prefer project number, exact project name, and client name + deliverable as evidence.
+- Do NOT treat generic brand guidelines as project-specific unless the project is
+  about that exact brand guideline.
+- If evidence is weak, use possible_match, not strong_match.
+
+Return ONLY valid JSON with this exact shape:
 {{
   "matches": [
     {{
       "document_id": "string",
+      "decision": "strong_match | possible_match | reject",
       "confidence_score": 0.0,
-      "reason": "short reason"
+      "evidence": "specific clue from the title/path/content",
+      "reason": "short explanation"
     }}
   ]
 }}
-
-Rules:
-- Include only documents that clearly belong to this project.
-- Do not guess. Exclude documents with no clear match.
-- Confidence must be between 0 and 1.
 
 Documents:
 {json.dumps(document_chunks, ensure_ascii=False)}
@@ -887,31 +1162,53 @@ Documents:
     return parsed.get("matches", [])
 
 
+def _match_passes(m: dict) -> bool:
+    """Keep strong matches ≥0.75 and possible matches ≥0.55 (rejects dropped)."""
+    decision = (m.get("decision") or "").lower()
+    score = float(m.get("confidence_score", 0) or 0)
+    if decision == "reject":
+        return False
+    if decision == "possible_match":
+        return score >= 0.55
+    # strong_match or unspecified decision (older prompt behaviour)
+    return score >= 0.75
+
+
 def taxonomy_sync():
     run_id = str(uuid.uuid4())
     started_at = now_iso()
     projects_processed = 0
     mappings_created = 0
-    documents = []
+    documents_seen = 0
+    candidate_limit = int(os.getenv("CANDIDATE_LIMIT", os.getenv("DOCUMENT_LIMIT", "50")))
 
     try:
-        projects = get_active_projects(limit=int(os.getenv("PROJECT_LIMIT", "20")))
-        documents = get_candidate_documents(limit=int(os.getenv("DOCUMENT_LIMIT", "200")))
+        ensure_schema()
+        projects = get_projects_for_processing(limit=int(os.getenv("PROJECT_LIMIT", "20")))
 
         for project in projects:
+            project_id = _row(project, "project_id")
+            documents = get_candidate_documents_for_project(project_id, limit=candidate_limit)
+            documents_seen += len(documents)
+
+            if not documents:
+                logger.info("taxonomy-sync: %s has no candidate documents", project_id)
+                projects_processed += 1
+                continue
+
             matches = classify_documents_for_project(project, documents)
             rows = [
                 {
-                    "project_id": _row(project, "project_id"),
+                    "project_id": project_id,
                     "document_id": m["document_id"],
-                    "confidence_score": float(m.get("confidence_score", 0)),
+                    "confidence_score": float(m.get("confidence_score", 0) or 0),
                     "matching_method": classifier_matching_method(),
-                    "classifier_reason": m.get("reason"),
+                    "classifier_reason": (m.get("reason") or m.get("evidence")),
                     "classified_at": now_iso(),
                     "run_id": run_id,
                 }
                 for m in matches
-                if m.get("confidence_score", 0) >= 0.75
+                if m.get("document_id") and _match_passes(m)
             ]
             insert_rows("project_document_map", rows)
             projects_processed += 1
@@ -920,15 +1217,15 @@ def taxonomy_sync():
         logger.info(json.dumps({
             "status": "ok", "job": "taxonomy-sync", "run_id": run_id,
             "projects_processed": projects_processed,
-            "documents_processed": len(documents),
+            "documents_processed": documents_seen,
             "mappings_created": mappings_created,
         }))
         log_pipeline_run("taxonomy-sync", run_id, started_at, "success",
-                         records_read=len(documents), records_written=mappings_created)
+                         records_read=documents_seen, records_written=mappings_created)
 
     except Exception as e:
         log_pipeline_run("taxonomy-sync", run_id, started_at, "error",
-                         records_read=len(documents), records_written=mappings_created,
+                         records_read=documents_seen, records_written=mappings_created,
                          error_message=str(e))
         raise
 
@@ -948,43 +1245,100 @@ def generate_wiki_for_project(project_id: str):
 
     docs = get_project_documents(project_id)
 
-    source_docs = [
-        {
-            "document_id": _row(doc, "document_id"),
-            "title": _row(doc, "title"),
-            "url": _row(doc, "url"),
-            "content": (_row(doc, "full_text") or _row(doc, "text_preview") or "")[:12000],
-        }
-        for doc in docs
-    ]
-
     # Use actual projects schema field names
     project_name = _row(project, "project_name")
     project_no = _row(project, "project_no") or project_id
     client_company = _row(project, "client_company")
     project_members = _row(project, "project_members")
+    project_type = _row(project, "project_type")
+    business_area = _row(project, "business_area")
+    start_date = _row(project, "start_date")
+    due_date = _row(project, "due_date")
+    description = _row(project, "description")
+
+    base_doc = {
+        "project_id": project_id,
+        "project_name": project_name,
+        "project_no": project_no,
+        "client_company": client_company,
+        "project_members": project_members,
+        "generated_at": firestore.SERVER_TIMESTAMP,
+        "source_document_ids": [_row(doc, "document_id") for doc in docs],
+    }
+
+    # No mapped sources → store a placeholder WITHOUT calling the LLM, so we
+    # never produce shallow "Not found in available sources" pages.
+    if not docs:
+        db.collection("wiki").document(project_id).set({
+            **base_doc,
+            "markdown": (
+                f"# {project_name}\n\n"
+                f"_No source documents have been mapped to this project yet._\n\n"
+                f"Run document discovery and taxonomy sync to populate this page."
+            ),
+            "wiki_status": "no_sources",
+            "generated_by_model": "none",
+        })
+        log_pipeline_run("wiki-generate", run_id, started_at, "success",
+                         records_read=0, records_written=1)
+        logger.info(json.dumps({
+            "status": "ok", "job": "wiki-generate",
+            "project_id": project_id, "source_document_count": 0,
+            "wiki_status": "no_sources",
+        }))
+        return
+
+    source_docs = [
+        {
+            "document_id": _row(doc, "document_id"),
+            "title": _row(doc, "title"),
+            "url": _row(doc, "source_url") or _row(doc, "url"),
+            "content": (_row(doc, "full_text") or _row(doc, "text_preview") or "")[:12000],
+        }
+        for doc in docs
+    ]
 
     prompt = f"""
-You are a technical documentarian for Admind Agency.
+You are an internal project intelligence documentarian for Admind Agency, a creative branding studio.
+Create a DeepWiki-style internal project page.
 
-Write the internal wiki page for:
-Project: {project_name} ({project_no}) | Client: {client_company}
+Project:
+- Project number: {project_no}
+- Project name: {project_name}
+- Client/company: {client_company}
+- Team: {project_members}
+- Period: {start_date} to {due_date}
+- Project type: {project_type}
+- Business area: {business_area}
+- Description: {description}
 
-Using ONLY the source documents below, write Markdown with these sections:
-## Overview
+Use ONLY the source documents below. Do not invent facts.
+If information is missing, write "Not found in available sources."
+
+Write Markdown with these sections:
+## Executive Summary
+5–8 bullet points: what this project is, why it exists, current state.
+## Project Scope
+Deliverables, channels, brand/campaign scope, markets, workstreams.
 ## Brief & Objectives
-## Team
+Business objectives and creative objectives, stated separately.
 ## Timeline
+Dates, milestones, approvals, meetings, delivery moments.
+## Team & Stakeholders
+Admind team, client stakeholders, external partners (separated if available).
 ## Key Decisions
-## Design Assets
+Decisions with source citations.
+## Design Assets & Deliverables
+Files/assets found, with document titles and URLs where available.
 ## Meeting Intelligence
-## Source Coverage
+Meeting notes, decisions, open questions, blockers, next steps.
+## Risks, Gaps & Unknowns
+Missing documents, unclear ownership, low confidence, incomplete coverage.
+## Source Map
+A table: | Source | Type | Why it matters | URL |
 
-Rules:
-- Only use information stated in the sources. Do not invent.
-- Cite the source document title for each important fact.
-- Flag sections with low source coverage.
-- If a section has no source support, write "Not found in available sources."
+Citation rule: for every factual claim, cite the document title in parentheses,
+e.g. "The project focuses on a website refresh (KI Website Refresh Pitch 2025.pptx)."
 
 Source documents:
 {json.dumps(source_docs, ensure_ascii=False)}
@@ -994,15 +1348,10 @@ Source documents:
     model_used = active_llm_label()
 
     db.collection("wiki").document(project_id).set({
-        "project_id": project_id,
-        "project_name": project_name,
-        "project_no": project_no,
-        "client_company": client_company,
-        "project_members": project_members,
+        **base_doc,
         "markdown": markdown,
-        "generated_at": firestore.SERVER_TIMESTAMP,
+        "wiki_status": "generated",
         "generated_by_model": model_used,
-        "source_document_ids": [_row(doc, "document_id") for doc in docs],
     })
 
     log_pipeline_run("wiki-generate", run_id, started_at, "success",
@@ -1015,9 +1364,16 @@ Source documents:
 
 
 def wiki_generate_all():
-    projects = get_active_projects(limit=int(os.getenv("PROJECT_LIMIT", "20")))
-    for project in projects:
-        pid = _row(project, "project_id")
+    """Generate wiki pages only for projects that actually have mapped documents."""
+    rows = get_project_ids_with_mapped_documents(limit=int(os.getenv("PROJECT_LIMIT", "20")))
+    if not rows:
+        logger.info(json.dumps({
+            "status": "ok", "job": "wiki-generate",
+            "note": "no projects with mapped documents",
+        }))
+        return
+    for row in rows:
+        pid = _row(row, "project_id")
         if pid:
             generate_wiki_for_project(pid)
 
@@ -1054,6 +1410,14 @@ def full_sync():
 # ---------------------------------------------------------------------------
 
 
+def historical_full_sync():
+    """Full pipeline over ALL projects (incl. completed) — for backfill runs."""
+    os.environ["SCORO_PROJECT_MODE"] = "all"
+    os.environ["PROJECT_MODE"] = "all"
+    logger.info("historical-full-sync: forcing SCORO_PROJECT_MODE=all, PROJECT_MODE=all")
+    full_sync()
+
+
 def run_job(job: str):
     dispatch = {
         "scoro-sync": scoro_sync,
@@ -1061,6 +1425,7 @@ def run_job(job: str):
         "taxonomy-sync": taxonomy_sync,
         "wiki-generate": wiki_generate_all,
         "full-sync": full_sync,
+        "historical-full-sync": historical_full_sync,
     }
 
     if job == "wiki-generate-one":
