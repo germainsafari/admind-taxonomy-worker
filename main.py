@@ -394,6 +394,81 @@ def get_project(project_id: str):
     return rows[0] if rows else None
 
 
+# Firestore limits each document (and each string field) to ~1 MiB.
+# Large wikis are split across wiki/{project_id}/markdown_chunks/{index}.
+WIKI_CHUNK_BYTES = int(os.getenv("WIKI_CHUNK_BYTES", "900000"))
+
+
+def _split_utf8_chunks(text: str, max_bytes: int) -> list[str]:
+    """Split text into UTF-8-safe chunks that each fit within max_bytes."""
+    if not text:
+        return [""]
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(encoded):
+        end = min(start + max_bytes, len(encoded))
+        # Do not split in the middle of a multi-byte UTF-8 character.
+        while end > start and end < len(encoded) and (encoded[end] & 0xC0) == 0x80:
+            end -= 1
+        if end == start:
+            end = min(start + max_bytes, len(encoded))
+        chunks.append(encoded[start:end].decode("utf-8", errors="ignore"))
+        start = end
+    return chunks
+
+
+def _delete_wiki_chunks(project_id: str):
+    """Remove stale markdown_chunks subcollection documents."""
+    chunk_col = db.collection("wiki").document(project_id).collection("markdown_chunks")
+    batch = db.batch()
+    count = 0
+    for doc in chunk_col.stream():
+        batch.delete(doc.reference)
+        count += 1
+        if count >= 400:
+            batch.commit()
+            batch = db.batch()
+            count = 0
+    if count:
+        batch.commit()
+
+
+def _store_wiki_markdown(project_id: str, base_doc: dict, markdown: str):
+    """
+    Persist wiki markdown. Small pages fit in the main `markdown` field.
+    Larger pages are split into wiki/{project_id}/markdown_chunks/{index}.
+    The main doc always keeps chunk 0 in `markdown` for backward compatibility.
+    """
+    chunks = _split_utf8_chunks(markdown, WIKI_CHUNK_BYTES)
+    chunked = len(chunks) > 1
+
+    base_doc["markdown"] = chunks[0]
+    base_doc["markdown_chunked"] = chunked
+    base_doc["markdown_chunk_count"] = len(chunks)
+    base_doc["markdown_total_bytes"] = len(markdown.encode("utf-8"))
+
+    db.collection("wiki").document(project_id).set(base_doc)
+
+    if chunked:
+        chunk_col = db.collection("wiki").document(project_id).collection("markdown_chunks")
+        existing = {doc.id for doc in chunk_col.stream()}
+        batch = db.batch()
+        for i, chunk in enumerate(chunks):
+            batch.set(
+                chunk_col.document(str(i)),
+                {"index": i, "content": chunk, "total_chunks": len(chunks)},
+            )
+        for stale_id in existing - {str(i) for i in range(len(chunks))}:
+            batch.delete(chunk_col.document(stale_id))
+        batch.commit()
+    else:
+        _delete_wiki_chunks(project_id)
+
+
 def get_project_documents(project_id: str, limit: int = 30) -> list:
     sql = f"""
     SELECT d.*
@@ -615,7 +690,17 @@ def scoro_sync():
         normalized = [normalize_scoro_project(p) for p in all_raw]
         upsert_projects(normalized)
 
-        logger.info(json.dumps({"status": "ok", "job": "scoro-sync", "projects_upserted": len(normalized)}))
+        status_counts: dict[str, int] = {}
+        for p in normalized:
+            st = p.get("status") or "unknown"
+            status_counts[st] = status_counts.get(st, 0) + 1
+
+        logger.info(json.dumps({
+            "status": "ok", "job": "scoro-sync",
+            "projects_upserted": len(normalized),
+            "scoro_project_mode": os.getenv("SCORO_PROJECT_MODE", "active"),
+            "status_breakdown": status_counts,
+        }))
         log_pipeline_run("scoro-sync", run_id, started_at, "success",
                          records_read=len(all_raw), records_written=len(normalized))
 
@@ -1243,7 +1328,9 @@ def generate_wiki_for_project(project_id: str):
     if not project:
         raise RuntimeError(f"Project not found in BigQuery: {project_id}")
 
-    docs = get_project_documents(project_id)
+    wiki_doc_limit = int(os.getenv("WIKI_MAX_SOURCE_DOCS", "30"))
+    wiki_char_limit = int(os.getenv("WIKI_SOURCE_CHARS", "12000"))
+    docs = get_project_documents(project_id, limit=wiki_doc_limit)
 
     # Use actual projects schema field names
     project_name = _row(project, "project_name")
@@ -1269,16 +1356,16 @@ def generate_wiki_for_project(project_id: str):
     # No mapped sources → store a placeholder WITHOUT calling the LLM, so we
     # never produce shallow "Not found in available sources" pages.
     if not docs:
-        db.collection("wiki").document(project_id).set({
+        placeholder = (
+            f"# {project_name}\n\n"
+            f"_No source documents have been mapped to this project yet._\n\n"
+            f"Run document discovery and taxonomy sync to populate this page."
+        )
+        _store_wiki_markdown(project_id, {
             **base_doc,
-            "markdown": (
-                f"# {project_name}\n\n"
-                f"_No source documents have been mapped to this project yet._\n\n"
-                f"Run document discovery and taxonomy sync to populate this page."
-            ),
             "wiki_status": "no_sources",
             "generated_by_model": "none",
-        })
+        }, placeholder)
         log_pipeline_run("wiki-generate", run_id, started_at, "success",
                          records_read=0, records_written=1)
         logger.info(json.dumps({
@@ -1293,7 +1380,7 @@ def generate_wiki_for_project(project_id: str):
             "document_id": _row(doc, "document_id"),
             "title": _row(doc, "title"),
             "url": _row(doc, "source_url") or _row(doc, "url"),
-            "content": (_row(doc, "full_text") or _row(doc, "text_preview") or "")[:12000],
+            "content": (_row(doc, "full_text") or _row(doc, "text_preview") or "")[:wiki_char_limit],
         }
         for doc in docs
     ]
@@ -1346,13 +1433,13 @@ Source documents:
 
     markdown = generate_text(prompt, temperature=0.2, json_mode=False)
     model_used = active_llm_label()
+    chunks = _split_utf8_chunks(markdown, WIKI_CHUNK_BYTES)
 
-    db.collection("wiki").document(project_id).set({
+    _store_wiki_markdown(project_id, {
         **base_doc,
-        "markdown": markdown,
-        "wiki_status": "generated",
+        "wiki_status": "generated_chunked" if len(chunks) > 1 else "generated",
         "generated_by_model": model_used,
-    })
+    }, markdown)
 
     log_pipeline_run("wiki-generate", run_id, started_at, "success",
                      records_read=len(docs), records_written=1)
@@ -1360,6 +1447,7 @@ Source documents:
     logger.info(json.dumps({
         "status": "ok", "job": "wiki-generate",
         "project_id": project_id, "source_document_count": len(docs),
+        "markdown_chunk_count": len(chunks),
     }))
 
 
@@ -1372,10 +1460,32 @@ def wiki_generate_all():
             "note": "no projects with mapped documents",
         }))
         return
+
+    succeeded, failures = 0, []
     for row in rows:
         pid = _row(row, "project_id")
-        if pid:
+        if not pid:
+            continue
+        try:
             generate_wiki_for_project(pid)
+            succeeded += 1
+        except Exception as e:
+            failures.append({"project_id": pid, "error": str(e)[:500]})
+            logger.error("wiki-generate: project %s failed: %s", pid, e)
+
+    logger.info(json.dumps({
+        "status": "ok" if succeeded > 0 else "error",
+        "job": "wiki-generate",
+        "projects_succeeded": succeeded,
+        "projects_failed": len(failures),
+        "failures": failures,
+    }))
+
+    if succeeded == 0 and failures:
+        raise RuntimeError(
+            f"wiki-generate: all {len(failures)} projects failed; "
+            f"first error: {failures[0]['error']}"
+        )
 
 # ---------------------------------------------------------------------------
 # FULL SYNC — runs the complete pipeline in order

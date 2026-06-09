@@ -287,17 +287,31 @@ Console: **Firestore → database `admindfirestore` → collection `wiki`**
 
 Each document ID is a `project_id`. Fields include `markdown`, `project_name`, `generated_at`, `source_document_ids`.
 
-Web app read pattern:
+Web app read pattern (handles chunked large wikis):
 
 ```python
 from google.cloud import firestore
 
 db = firestore.Client(project="admind-data-organisation", database="admindfirestore")
-doc = db.collection("wiki").document("scoro_566170").get()
-if doc.exists:
-    wiki = doc.to_dict()
-    markdown = wiki["markdown"]
+
+def load_wiki_markdown(project_id: str) -> str | None:
+    ref = db.collection("wiki").document(project_id)
+    snap = ref.get()
+    if not snap.exists:
+        return None
+    wiki = snap.to_dict()
+    if not wiki.get("markdown_chunked"):
+        return wiki.get("markdown", "")
+    parts = []
+    for chunk in ref.collection("markdown_chunks").order_by("index").stream():
+        parts.append(chunk.to_dict().get("content", ""))
+    return "".join(parts)
+
+markdown = load_wiki_markdown("scoro_566170")
 ```
+
+Large wikis (> ~900 KB) are split into subcollection `wiki/{project_id}/markdown_chunks/{0,1,2,...}`.
+The main doc still has chunk 0 in `markdown` for backward compatibility.
 
 ## Firestore wiki document shape
 
@@ -308,7 +322,11 @@ if doc.exists:
 | `project_no` | Scoro project number |
 | `client_company` | Client name |
 | `project_members` | Team members |
-| `markdown` | Generated wiki page (Markdown) |
+| `markdown` | Wiki Markdown (full page, or chunk 0 when chunked) |
+| `markdown_chunked` | `true` when additional chunks exist in subcollection |
+| `markdown_chunk_count` | Total number of chunks |
+| `markdown_total_bytes` | Full wiki size in bytes |
+| `wiki_status` | `generated`, `generated_chunked`, or `no_sources` |
 | `generated_at` | Server timestamp |
 | `generated_by_model` | LLM used (e.g. `gemini-api:gemini-2.5-flash`) |
 | `source_document_ids` | Document IDs used as sources |
