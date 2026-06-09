@@ -542,20 +542,74 @@ def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
     return data
 
 
-def fetch_scoro_projects(page: int = 1, per_page: int = 50) -> list[dict]:
-    """
-    Fetch one page of projects from Scoro API v2.
+# Scoro project status values (from Scoro API v2 docs).
+SCORO_ACTIVE_STATUS = "inprogress"
+SCORO_ALL_STATUSES = (
+    "pending", "inprogress", "cancelled", "completed", "future",
+    "additional1", "additional2", "additional3", "additional4",
+)
 
-    SCORO_PROJECT_MODE=active (default) → only status=inprogress (matches the
-    old behaviour). SCORO_PROJECT_MODE=all → no status filter, so completed,
-    cancelled and archived projects are returned too (use for backfill).
+
+def _scoro_project_mode() -> str:
+    return os.getenv("SCORO_PROJECT_MODE", "active").lower()
+
+
+def _scoro_statuses_to_fetch() -> list[str]:
     """
+    Scoro's list endpoint filters by one status at a time. 'all' mode queries
+    every known status and deduplicates — omitting the filter still returns only
+    inprogress on many accounts.
+    """
+    mode = _scoro_project_mode()
+    if mode == "active":
+        return [SCORO_ACTIVE_STATUS]
+
+    custom = os.getenv("SCORO_STATUSES", "").strip()
+    if custom:
+        return [s.strip() for s in custom.split(",") if s.strip()]
+    return list(SCORO_ALL_STATUSES)
+
+
+def fetch_scoro_projects_page(
+    page: int = 1,
+    per_page: int = 100,
+    status: str | None = None,
+) -> list[dict]:
+    """Fetch one page of projects, optionally filtered by status."""
     body: dict = {"page": page, "per_page": per_page}
-    if os.getenv("SCORO_PROJECT_MODE", "active").lower() == "active":
-        body["filter"] = {"status": "inprogress"}
-
+    if status:
+        body["filter"] = {"status": status}
     data = _scoro_post("projects/list", body)
     return data.get("data", [])
+
+
+def fetch_all_scoro_projects() -> list[dict]:
+    """Paginate through every configured status and deduplicate by project_id."""
+    per_page = int(os.getenv("SCORO_PER_PAGE", "100"))
+    statuses = _scoro_statuses_to_fetch()
+    seen_ids: set = set()
+    all_raw: list[dict] = []
+
+    for status in statuses:
+        page, status_count = 1, 0
+        while True:
+            batch = fetch_scoro_projects_page(page=page, per_page=per_page, status=status)
+            if not batch:
+                break
+            for project in batch:
+                pid = project.get("project_id") or project.get("id")
+                if pid is None or pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                all_raw.append(project)
+                status_count += 1
+            if len(batch) < per_page:
+                break
+            page += 1
+        logger.info("scoro-sync: status=%s added %d projects (%d unique total)",
+                    status, status_count, len(all_raw))
+
+    return all_raw
 
 
 def _safe_date_str(val) -> str | None:
@@ -677,16 +731,7 @@ def scoro_sync():
     started_at = now_iso()
 
     try:
-        page, all_raw = 1, []
-        while True:
-            batch = fetch_scoro_projects(page=page, per_page=50)
-            if not batch:
-                break
-            all_raw.extend(batch)
-            if len(batch) < 50:
-                break
-            page += 1
-
+        all_raw = fetch_all_scoro_projects()
         normalized = [normalize_scoro_project(p) for p in all_raw]
         upsert_projects(normalized)
 
@@ -698,7 +743,8 @@ def scoro_sync():
         logger.info(json.dumps({
             "status": "ok", "job": "scoro-sync",
             "projects_upserted": len(normalized),
-            "scoro_project_mode": os.getenv("SCORO_PROJECT_MODE", "active"),
+            "scoro_project_mode": _scoro_project_mode(),
+            "statuses_queried": _scoro_statuses_to_fetch(),
             "status_breakdown": status_counts,
         }))
         log_pipeline_run("scoro-sync", run_id, started_at, "success",
@@ -1492,7 +1538,33 @@ def wiki_generate_all():
 # ---------------------------------------------------------------------------
 
 
+def _apply_full_sync_defaults():
+    """
+    Defaults for a one-click full pipeline run (Console UI → Execute).
+
+    - SCORO_PROJECT_MODE=all  → import the full Scoro catalog (all statuses)
+    - PROJECT_MODE=active     → discovery / taxonomy / wiki on open projects only
+    """
+    defaults = {
+        "SCORO_PROJECT_MODE": "all",
+        "PROJECT_MODE": "active",
+    }
+    for key, value in defaults.items():
+        if not os.getenv(key):
+            os.environ[key] = value
+
+    logger.info(json.dumps({
+        "event": "full-sync-config",
+        "scoro_project_mode": os.getenv("SCORO_PROJECT_MODE"),
+        "project_mode": os.getenv("PROJECT_MODE"),
+        "project_limit": os.getenv("PROJECT_LIMIT", "20"),
+        "document_limit": os.getenv("DOCUMENT_LIMIT", "25"),
+        "candidate_limit": os.getenv("CANDIDATE_LIMIT", "50"),
+    }))
+
+
 def full_sync():
+    _apply_full_sync_defaults()
     run_id = str(uuid.uuid4())
     started_at = now_iso()
 
@@ -1529,6 +1601,14 @@ def historical_full_sync():
 
 
 def run_job(job: str):
+    logger.info(json.dumps({
+        "event": "job_start",
+        "job_type": job,
+        "scoro_project_mode": os.getenv("SCORO_PROJECT_MODE", "active"),
+        "project_mode": os.getenv("PROJECT_MODE", "active"),
+        "project_limit": os.getenv("PROJECT_LIMIT", "20"),
+    }))
+
     dispatch = {
         "scoro-sync": scoro_sync,
         "document-discovery": document_discovery,
@@ -1553,4 +1633,4 @@ def run_job(job: str):
 
 
 if __name__ == "__main__":
-    run_job(os.getenv("JOB_TYPE", "taxonomy-sync"))
+    run_job(os.getenv("JOB_TYPE", "full-sync"))

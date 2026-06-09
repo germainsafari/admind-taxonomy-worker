@@ -32,6 +32,51 @@ LLM wiki writer            ← wiki-generate
 Firestore.wiki/{project_id}   ← web app reads from here
 ```
 
+## Run everything (one worker, one click)
+
+This worker **is** the full pipeline. You do not need separate jobs for Scoro,
+discovery, taxonomy, or wiki — they are steps inside one Cloud Run Job.
+
+Set `JOB_TYPE=full-sync` (the default) and click **Execute**. It runs all four
+steps in order:
+
+1. **scoro-sync** — fetch projects from Scoro → `BigQuery.projects`
+2. **document-discovery** — search Gemini Enterprise → `BigQuery.documents` + candidates
+3. **taxonomy-sync** — LLM classifies documents per project → `project_document_map`
+4. **wiki-generate** — write wiki pages → `Firestore.wiki`
+
+`full-sync` automatically uses:
+- `SCORO_PROJECT_MODE=all` — imports **all** Scoro statuses into BigQuery
+- `PROJECT_MODE=active` — runs discovery/taxonomy/wiki on **open** projects only
+
+The other job types (`scoro-sync`, `wiki-generate`, etc.) exist only for
+debugging one step in isolation.
+
+### Run from the Google Cloud Console (UI)
+
+1. Open [Cloud Run Jobs](https://console.cloud.google.com/run/jobs?project=admind-data-organisation)
+2. Select region **europe-west1**
+3. Click job **admind-taxonomy-worker**
+4. Click **Execute** (top button)
+5. Leave overrides empty — the job template already has `JOB_TYPE=full-sync`
+6. Open the **Logs** tab on the execution and confirm you see:
+   - `full-sync: starting step scoro-sync`
+   - `full-sync: starting step document-discovery`
+   - `full-sync: starting step taxonomy-sync`
+   - `full-sync: starting step wiki-generate`
+
+**If logs show only one step** (e.g. only `wiki-generate`), the job template
+still has the wrong `JOB_TYPE`. Fix it once:
+
+1. On the job page → **Edit & deploy new revision** (or **Edit**)
+2. **Variables & Secrets** tab → set `JOB_TYPE` = `full-sync`
+3. Also confirm: `SCORO_PROJECT_MODE=all`, `PROJECT_MODE=active`
+4. Deploy, then **Execute** again
+
+Optional per-run override in the Execute dialog:
+- **Variables** tab → add `PROJECT_LIMIT=50` to process more active projects
+- Use `JOB_TYPE=historical-full-sync` to also run discovery/wiki on completed projects
+
 ## Job types
 
 Set `JOB_TYPE` to select which step runs:
@@ -43,7 +88,7 @@ Set `JOB_TYPE` to select which step runs:
 | `taxonomy-sync` | LLM classifies each project's **own** candidate documents → `project_document_map` |
 | `wiki-generate` | Generate Markdown wiki **only for projects with mapped documents** → Firestore `wiki` |
 | `wiki-generate-one` | Generate wiki for a single project (requires `PROJECT_ID_TO_GENERATE`) |
-| `full-sync` | Runs all four steps in order over **active** projects (use for nightly scheduling) |
+| `full-sync` | **Default.** Runs all four steps: Scoro (all statuses) → discovery → taxonomy → wiki (active projects) |
 | `historical-full-sync` | Same pipeline but over **all** projects incl. completed (backfill; sets `PROJECT_MODE=all`, `SCORO_PROJECT_MODE=all`) |
 
 ## Requirements
@@ -142,7 +187,9 @@ Copy [.env.example](.env.example) for local development. Cloud Run uses env vars
 | `DOCUMENT_LIMIT` | `25` | Discovery Engine page size per search query |
 | `CANDIDATE_LIMIT` | `50` | Max per-project candidate docs the classifier sees |
 | `PROJECT_MODE` | `active` | Which projects to process: `active` or `all` |
-| `SCORO_PROJECT_MODE` | `active` | Which projects to fetch from Scoro: `active` (inprogress) or `all` |
+| `SCORO_PROJECT_MODE` | `active` | `active` = inprogress only; `all` = every Scoro status (pending, completed, cancelled, …) |
+| `SCORO_STATUSES` | — | Optional comma-separated status override when mode is `all` |
+| `SCORO_PER_PAGE` | `100` | Scoro API page size (max 100) |
 | `PROJECT_ID_TO_GENERATE` | — | Required for `wiki-generate-one` |
 
 ## Local development
