@@ -1,5 +1,5 @@
 steps:
-  # Step 1 — Build the image
+  # Step 1 — Build the Docker image (uses Dockerfile, NOT buildpacks)
   - name: gcr.io/cloud-builders/docker
     id: Build
     args:
@@ -8,21 +8,22 @@ steps:
       - $_IMAGE_TAG
       - .
 
-  # Step 2 — Push the image
+  # Step 2 — Push to Artifact Registry
   - name: gcr.io/cloud-builders/docker
     id: Push
     args:
       - push
       - $_IMAGE_TAG
 
-  # Step 3 — Create or update the Cloud Run Job
+  # Step 3 — Update existing job, or create it if it does not exist yet.
+  #           All runtime env vars and secrets are already set on the job;
+  #           this step only updates the container image.
   - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
     id: Deploy
     entrypoint: bash
     args:
       - -c
       - |
-        # Try to update an existing job first; if it doesn't exist yet, create it.
         gcloud run jobs update admind-taxonomy-worker \
           --image=$_IMAGE_TAG \
           --region=$_REGION \
@@ -43,9 +44,11 @@ images:
   - $_IMAGE_TAG
 
 substitutions:
-  _REGION: europe-west4
+  # Cloud Run Job lives in europe-west1
+  _REGION: europe-west1
   _SERVICE_ACCOUNT: project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com
-  _IMAGE_TAG: europe-west4-docker.pkg.dev/$PROJECT_ID/admind/admind-taxonomy-worker:$COMMIT_SHA
+  # Artifact Registry in europe-west1 (matches job region; any AR region works fine)
+  _IMAGE_TAG: europe-west1-docker.pkg.dev/$PROJECT_ID/admind/admind-taxonomy-worker:$COMMIT_SHA
 
 options:
   logging: CLOUD_LOGGING_ONLY

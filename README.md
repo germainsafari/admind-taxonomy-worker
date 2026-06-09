@@ -172,27 +172,58 @@ python main.py
 
 ## Deployment
 
-Deployed as a **Cloud Run Job** (not a Service). The container runs `python main.py` and exits — no HTTP server required.
+Deployed as a **Cloud Run Job** (not a Service). The container runs `python main.py`
+and exits — no HTTP server is involved.
 
-### Via Cloud Build
+> **Do NOT use `gcloud run jobs deploy --source .`**  
+> That flag triggers Google Cloud Buildpacks which tries to wrap the app in gunicorn
+> and fails because this is a job, not a web service. Always build via Docker as shown
+> below.
+
+### Recommended: Cloud Build (CI/CD, one command)
+
+Builds the Docker image, pushes it to Artifact Registry, and updates the Cloud Run
+Job in one step:
 
 ```bash
 gcloud builds submit --config cloudbuild.yaml
 ```
 
-Pipeline: build image → push to Artifact Registry → create/update Cloud Run Job.
-
-### Manual deploy (with all env vars and secrets)
+The first time you run this, the Artifact Registry repository
+`europe-west1-docker.pkg.dev/admind-data-organisation/admind` must exist:
 
 ```bash
-gcloud run jobs deploy admind-taxonomy-worker \
-  --source . \
-  --region europe-west1 \
-  --service-account project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com \
-  --set-env-vars "PROJECT_ID=admind-data-organisation,DATASET=admind_data_organisation,LOCATION=europe-west4,FIRESTORE_DATABASE=admindfirestore,MODEL_NAME=gemini-2.5-flash,OPENAI_MODEL=gpt-4o-mini,LLM_PROVIDER=auto,JOB_TYPE=full-sync,PROJECT_LIMIT=20,DOCUMENT_LIMIT=10,SCORO_BASE_URL=https://admindagency.scoro.com,SCORO_COMPANY_ACCOUNT_ID=admindagency,DISCOVERY_ENGINE_PROJECT_NUMBER=493121771508,DISCOVERY_ENGINE_LOCATION=global,DISCOVERY_ENGINE_COLLECTION=default_collection,DISCOVERY_ENGINE_ENGINE_ID=gemini-enterprise-admind,DISCOVERY_ENGINE_SERVING_CONFIG=default_search,DISCOVERY_IMPERSONATE_USER=your-user@admindagency.com" \
+gcloud artifacts repositories create admind \
+  --repository-format=docker \
+  --location=europe-west1 \
+  --project=admind-data-organisation
+```
+
+### Alternative: build Docker image then deploy
+
+Use this when you want full control, or if Cloud Build isn't set up yet.
+
+```bash
+IMAGE=europe-west1-docker.pkg.dev/admind-data-organisation/admind/admind-taxonomy-worker:latest
+
+# Build and push (run from the repo root)
+docker build -t $IMAGE .
+docker push $IMAGE
+
+# Create the job (first time only)
+gcloud run jobs create admind-taxonomy-worker \
+  --image=$IMAGE \
+  --region=europe-west1 \
+  --service-account=project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com \
+  --set-env-vars "PROJECT_ID=admind-data-organisation,DATASET=admind_data_organisation,LOCATION=europe-west4,FIRESTORE_DATABASE=admindfirestore,MODEL_NAME=gemini-2.5-flash,LLM_PROVIDER=auto,JOB_TYPE=full-sync,PROJECT_MODE=active,SCORO_PROJECT_MODE=active,PROJECT_LIMIT=20,DOCUMENT_LIMIT=25,CANDIDATE_LIMIT=50,SCORO_BASE_URL=https://admindagency.scoro.com,SCORO_COMPANY_ACCOUNT_ID=admindagency,DISCOVERY_ENGINE_PROJECT_NUMBER=493121771508,DISCOVERY_ENGINE_LOCATION=global,DISCOVERY_ENGINE_COLLECTION=default_collection,DISCOVERY_ENGINE_ENGINE_ID=gemini-enterprise-admind,DISCOVERY_ENGINE_SERVING_CONFIG=default_search,DISCOVERY_IMPERSONATE_USER=germain.safari@admindagency.com" \
   --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,OPENAI_API_KEY=openai-api-key:latest,SCORO_API_KEY=scoro-api-token:latest" \
-  --task-timeout 3600 \
-  --max-retries 0
+  --task-timeout=3600 \
+  --max-retries=0
+
+# Subsequent deploys — update image only (env vars/secrets already set)
+gcloud run jobs update admind-taxonomy-worker \
+  --image=$IMAGE \
+  --region=europe-west1
 ```
 
 ## Running and testing
