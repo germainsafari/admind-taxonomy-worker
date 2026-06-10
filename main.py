@@ -1,14 +1,15 @@
-"""
-admind-taxonomy-worker  —  Cloud Run Job
-Pipeline: Scoro → BigQuery.projects
-          Discovery Engine → BigQuery.documents
-          LLM classifier → BigQuery.project_document_map
-          LLM wiki writer → Firestore.wiki
+﻿"""
+admind-taxonomy-worker  â€”  Cloud Run Job
+Pipeline: Scoro â†’ BigQuery.projects
+          Discovery Engine â†’ BigQuery.documents
+          LLM classifier â†’ BigQuery.project_document_map
+          LLM wiki writer â†’ Firestore.wiki
 """
 
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -32,10 +33,12 @@ PROJECT_ID = os.getenv("PROJECT_ID", "admind-data-organisation")
 DATASET = os.getenv("DATASET", "admind_data_organisation")
 LOCATION = os.getenv("LOCATION", "europe-west4")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+# Wiki pages benefit from a stronger model than classification does.
+WIKI_MODEL_NAME = os.getenv("WIKI_MODEL_NAME", "gemini-2.5-pro")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-# auto  → Gemini API key → Vertex AI Gemini → OpenAI
-# gemini → Gemini API key → Vertex AI Gemini (no OpenAI fallback)
-# openai → OpenAI only
+# auto  â†’ Gemini API key â†’ Vertex AI Gemini â†’ OpenAI
+# gemini â†’ Gemini API key â†’ Vertex AI Gemini (no OpenAI fallback)
+# openai â†’ OpenAI only
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "auto").lower()
 
 SCORO_BASE_URL = os.getenv("SCORO_BASE_URL", "").rstrip("/")
@@ -64,7 +67,7 @@ db = firestore.Client(project=PROJECT_ID, database=os.getenv("FIRESTORE_DATABASE
 
 # ---------------------------------------------------------------------------
 # LLM layer
-# Priority: Gemini Developer API (GEMINI_API_KEY) → Vertex AI Gemini → OpenAI
+# Priority: Gemini Developer API (GEMINI_API_KEY) â†’ Vertex AI Gemini â†’ OpenAI
 # ---------------------------------------------------------------------------
 
 _vertex_model = None
@@ -81,16 +84,16 @@ def _openai_api_key() -> str:
     return os.getenv("OPENAI_API_KEY", "").strip()
 
 
-# ── Gemini Developer API (AI Studio / google-generativeai) ──────────────────
+# â”€â”€ Gemini Developer API (AI Studio / google-generativeai) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def _generate_with_gemini_api_key(prompt: str, *, temperature: float, json_mode: bool) -> str:
+def _generate_with_gemini_api_key(prompt: str, *, temperature: float, json_mode: bool, model_name: str) -> str:
     import google.generativeai as genai  # lazy import
 
     genai.configure(api_key=_gemini_api_key())
     config_kwargs = {"temperature": temperature}
     if json_mode:
         config_kwargs["response_mime_type"] = "application/json"
-    model = genai.GenerativeModel(MODEL_NAME)
+    model = genai.GenerativeModel(model_name)
     response = model.generate_content(
         prompt,
         generation_config=genai.GenerationConfig(**config_kwargs),
@@ -98,26 +101,28 @@ def _generate_with_gemini_api_key(prompt: str, *, temperature: float, json_mode:
     return response.text
 
 
-# ── Vertex AI Gemini (service account, no API key needed) ───────────────────
+# â”€â”€ Vertex AI Gemini (service account, no API key needed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def _get_vertex_model():
+def _get_vertex_model(model_name: str):
     global _vertex_model, _vertex_unavailable
     if _vertex_unavailable:
         return None
-    if _vertex_model is not None:
-        return _vertex_model
+    if _vertex_model is not None and _vertex_model.get(model_name):
+        return _vertex_model[model_name]
     try:
         vertexai.init(project=PROJECT_ID, location=LOCATION)
-        _vertex_model = GenerativeModel(MODEL_NAME)
-        return _vertex_model
+        if _vertex_model is None:
+            _vertex_model = {}
+        _vertex_model[model_name] = GenerativeModel(model_name)
+        return _vertex_model[model_name]
     except Exception as e:
         _vertex_unavailable = True
         logger.warning("Vertex AI Gemini unavailable: %s", e)
         return None
 
 
-def _generate_with_vertex_gemini(prompt: str, *, temperature: float, json_mode: bool) -> str:
-    model = _get_vertex_model()
+def _generate_with_vertex_gemini(prompt: str, *, temperature: float, json_mode: bool, model_name: str) -> str:
+    model = _get_vertex_model(model_name)
     if model is None:
         raise RuntimeError("Vertex AI Gemini is not available")
     config_kwargs = {"temperature": temperature}
@@ -130,7 +135,7 @@ def _generate_with_vertex_gemini(prompt: str, *, temperature: float, json_mode: 
     return response.text
 
 
-# ── OpenAI ──────────────────────────────────────────────────────────────────
+# â”€â”€ OpenAI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _get_openai_client():
     global _openai_client
@@ -157,15 +162,17 @@ def _generate_with_openai(prompt: str, *, temperature: float, json_mode: bool) -
     return response.choices[0].message.content or ""
 
 
-# ── Router ───────────────────────────────────────────────────────────────────
+# â”€â”€ Router â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-def generate_text(prompt: str, *, temperature: float = 0, json_mode: bool = False) -> str:
+def generate_text(prompt: str, *, temperature: float = 0, json_mode: bool = False,
+                  model_name: str | None = None) -> str:
     """
-    LLM_PROVIDER=auto   → Gemini API key → Vertex AI Gemini → OpenAI
-    LLM_PROVIDER=gemini → Gemini API key → Vertex AI Gemini  (no OpenAI fallback)
-    LLM_PROVIDER=openai → OpenAI only
+    LLM_PROVIDER=auto   â†’ Gemini API key â†’ Vertex AI Gemini â†’ OpenAI
+    LLM_PROVIDER=gemini â†’ Gemini API key â†’ Vertex AI Gemini  (no OpenAI fallback)
+    LLM_PROVIDER=openai â†’ OpenAI only
     """
     global _active_llm_label
+    model = model_name or MODEL_NAME
 
     if LLM_PROVIDER == "openai":
         _active_llm_label = f"openai:{OPENAI_MODEL}"
@@ -176,16 +183,16 @@ def generate_text(prompt: str, *, temperature: float = 0, json_mode: bool = Fals
     # 1. Gemini Developer API (requires GEMINI_API_KEY)
     if _gemini_api_key():
         try:
-            _active_llm_label = f"gemini-api:{MODEL_NAME}"
-            return _generate_with_gemini_api_key(prompt, temperature=temperature, json_mode=json_mode)
+            _active_llm_label = f"gemini-api:{model}"
+            return _generate_with_gemini_api_key(prompt, temperature=temperature, json_mode=json_mode, model_name=model)
         except Exception as e:
             gemini_errors.append(f"Gemini API key: {e}")
             logger.warning("Gemini Developer API failed, trying next option: %s", e)
 
-    # 2. Vertex AI Gemini (uses service account — no API key needed)
+    # 2. Vertex AI Gemini (uses service account â€” no API key needed)
     try:
-        _active_llm_label = f"gemini-vertex:{MODEL_NAME}"
-        return _generate_with_vertex_gemini(prompt, temperature=temperature, json_mode=json_mode)
+        _active_llm_label = f"gemini-vertex:{model}"
+        return _generate_with_vertex_gemini(prompt, temperature=temperature, json_mode=json_mode, model_name=model)
     except Exception as e:
         gemini_errors.append(f"Vertex AI Gemini: {e}")
         logger.warning("Vertex AI Gemini failed: %s", e)
@@ -202,7 +209,7 @@ def generate_text(prompt: str, *, temperature: float = 0, json_mode: bool = Fals
             f"Errors: {'; '.join(gemini_errors)}"
         )
 
-    logger.warning("All Gemini options failed — falling back to OpenAI")
+    logger.warning("All Gemini options failed â€” falling back to OpenAI")
     _active_llm_label = f"openai:{OPENAI_MODEL}"
     return _generate_with_openai(prompt, temperature=temperature, json_mode=json_mode)
 
@@ -274,6 +281,14 @@ def ensure_schema():
     ADD COLUMN IF NOT EXISTS source_url STRING
     """).result()
 
+    # Columns introduced by the custom-fields / status-label fixes.
+    bq.query(f"""
+    ALTER TABLE `{PROJECT_ID}.{DATASET}.projects`
+    ADD COLUMN IF NOT EXISTS status_name STRING,
+    ADD COLUMN IF NOT EXISTS tags STRING,
+    ADD COLUMN IF NOT EXISTS project_manager_name STRING
+    """).result()
+
     _schema_ready = True
 
 
@@ -295,7 +310,7 @@ def log_pipeline_run(
     records_written: int = 0,
     error_message: str | None = None,
 ):
-    """Append-only log to pipeline_runs. Never updates — avoids BQ streaming-buffer error."""
+    """Append-only log to pipeline_runs. Never updates â€” avoids BQ streaming-buffer error."""
     insert_rows(
         "pipeline_runs",
         [{
@@ -317,7 +332,7 @@ def log_pipeline_run(
 
 
 def _project_mode() -> str:
-    """active → only open projects; all → every project incl. completed."""
+    """active â†’ only open projects; all â†’ every project incl. completed."""
     return os.getenv("PROJECT_MODE", "active").lower()
 
 
@@ -325,7 +340,7 @@ def get_active_projects(limit: int = 20) -> list:
     sql = f"""
     SELECT *
     FROM `{PROJECT_ID}.{DATASET}.projects`
-    WHERE LOWER(CAST(status AS STRING)) NOT IN ('done', 'completed', 'cancelled', 'closed')
+    WHERE LOWER(CAST(status AS STRING)) NOT IN ('done', 'completed', 'cancelled', 'closed', 'future')
     ORDER BY start_date DESC
     LIMIT @limit
     """
@@ -503,7 +518,7 @@ def _scoro_post(endpoint: str, body_extra: dict | None = None) -> dict:
     if not SCORO_COMPANY_ACCOUNT_ID:
         raise RuntimeError(
             "SCORO_COMPANY_ACCOUNT_ID is required. "
-            "Find it in Scoro → Settings → Site settings → General."
+            "Find it in Scoro â†’ Settings â†’ Site settings â†’ General."
         )
 
     body: dict = {
@@ -557,7 +572,7 @@ def _scoro_project_mode() -> str:
 def _scoro_statuses_to_fetch() -> list[str]:
     """
     Scoro's list endpoint filters by one status at a time. 'all' mode queries
-    every known status and deduplicates — omitting the filter still returns only
+    every known status and deduplicates â€” omitting the filter still returns only
     inprogress on many accounts.
     """
     mode = _scoro_project_mode()
@@ -619,35 +634,166 @@ def _safe_date_str(val) -> str | None:
     return str(val)[:10]  # keep only YYYY-MM-DD
 
 
-def normalize_scoro_project(raw: dict) -> dict:
+# â”€â”€ Scoro lookup caches (users, companies) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Built once per sync run so manager_id / members[] / c_clientcompany resolve
+# to human-readable names instead of opaque numeric IDs.
+
+_scoro_user_cache: dict[str, str] | None = None
+_scoro_company_cache: dict[str, str] | None = None
+
+
+def _fetch_scoro_list(endpoint: str, body_extra: dict | None = None) -> list[dict]:
+    """Paginate through a Scoro list endpoint and return every row."""
+    per_page = int(os.getenv("SCORO_PER_PAGE", "100"))
+    rows: list[dict] = []
+    page = 1
+    while True:
+        body = {"page": page, "per_page": per_page}
+        if body_extra:
+            body.update(body_extra)
+        data = _scoro_post(endpoint, body)
+        batch = data.get("data", []) or []
+        rows.extend(batch)
+        if len(batch) < per_page:
+            break
+        page += 1
+    return rows
+
+
+def get_scoro_user_cache() -> dict[str, str]:
+    """user_id â†’ 'Firstname Lastname' for every Scoro user."""
+    global _scoro_user_cache
+    if _scoro_user_cache is not None:
+        return _scoro_user_cache
+    cache: dict[str, str] = {}
+    try:
+        for u in _fetch_scoro_list("users/list"):
+            uid = str(u.get("id") or u.get("user_id") or "")
+            name = " ".join(
+                p for p in [str(u.get("firstname") or "").strip(),
+                            str(u.get("lastname") or "").strip()]
+                if p
+            ) or str(u.get("full_name") or u.get("email") or "")
+            if uid and name:
+                cache[uid] = name
+    except Exception as e:
+        logger.warning("scoro-sync: could not build user cache: %s", e)
+    _scoro_user_cache = cache
+    logger.info("scoro-sync: user cache built with %d users", len(cache))
+    return cache
+
+
+def get_scoro_company_cache() -> dict[str, str]:
+    """company/contact_id â†’ company name for Scoro company contacts."""
+    global _scoro_company_cache
+    if _scoro_company_cache is not None:
+        return _scoro_company_cache
+    cache: dict[str, str] = {}
+    rows: list[dict] = []
+    try:
+        rows = _fetch_scoro_list("companies/list")
+    except Exception as e:
+        logger.warning("scoro-sync: companies/list failed (%s); trying contacts/list", e)
+        try:
+            rows = _fetch_scoro_list("contacts/list", {"filter": {"contact_type": "company"}})
+        except Exception as e2:
+            logger.warning("scoro-sync: could not build company cache: %s", e2)
+    for c in rows:
+        cid = str(c.get("company_id") or c.get("contact_id") or c.get("id") or "")
+        name = str(c.get("name") or c.get("company_name") or "").strip()
+        if cid and name:
+            cache[cid] = name
+    _scoro_company_cache = cache
+    logger.info("scoro-sync: company cache built with %d companies", len(cache))
+    return cache
+
+
+def _resolve_members(raw: dict, user_cache: dict[str, str]) -> str:
+    """Resolve the project's members[] ID list to comma-separated names."""
+    members = raw.get("members") or raw.get("project_users") or []
+    if not isinstance(members, (list, tuple)):
+        return ""
+    names = []
+    for m in members:
+        mid = str(m.get("user_id") or m.get("id") or m) if isinstance(m, dict) else str(m)
+        name = user_cache.get(mid)
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names)
+
+
+def normalize_scoro_project(
+    raw: dict,
+    user_cache: dict[str, str] | None = None,
+    company_cache: dict[str, str] | None = None,
+) -> dict:
     """Map a Scoro API v2 project object to the BigQuery projects table schema."""
-    # v2 uses project_id (not id), project_name (not name), manager_id (not manager object)
+    user_cache = user_cache or {}
+    company_cache = company_cache or {}
+
     scoro_id = str(raw.get("project_id") or raw.get("id") or "")
+
+    # Scoro API v2 nests every custom field under customFields.{key}.
+    # Reading them as top-level keys always returned None (audit Â§3).
+    cf = raw.get("customFields") or raw.get("custom_fields") or {}
+
+    def custom(key: str) -> str:
+        val = cf.get(key)
+        if val is None:
+            val = raw.get(key)  # fallback for accounts that flatten them
+        if isinstance(val, (list, tuple)):
+            return ", ".join(str(v) for v in val if v)
+        return str(val or "")
+
+    # Manager: managerId (v2 casing) â†’ resolve to name via user cache.
+    manager_id = str(raw.get("managerId") or raw.get("manager_id") or "")
+    manager_name = (
+        user_cache.get(manager_id)
+        or str(raw.get("manager_email") or "")
+        or manager_id
+    )
+
+    # Client company: resolve numeric c_clientcompany / company_id to a name.
+    company_id = str(raw.get("company_id") or custom("c_clientcompany") or "")
+    client_company = (
+        str(raw.get("company_name") or "")
+        or company_cache.get(company_id)
+        or ""
+    )
+
+    tags = raw.get("tags") or []
+    if isinstance(tags, (list, tuple)):
+        tags = ", ".join(str(t) for t in tags if t)
+    else:
+        tags = str(tags or "")
 
     return {
         "project_id": f"scoro_{scoro_id}",
         "scoro_id": scoro_id,
         "project_no": str(raw.get("no", "") or ""),
         "project_name": str(raw.get("project_name") or raw.get("name") or ""),
+        # Keep the internal status code for filtering AND the human label.
         "status": str(raw.get("status") or ""),
-        # v2 returns manager_id + manager_email, not a name object
-        "project_manager": str(raw.get("manager_email") or raw.get("manager_id") or ""),
-        "project_members": "",   # not returned in list endpoint; enriched separately if needed
+        "status_name": str(raw.get("statusName") or raw.get("status_name") or ""),
+        "project_manager": manager_name,
+        "project_manager_name": manager_name,
+        "project_members": _resolve_members(raw, user_cache),
         "start_date": _safe_date_str(raw.get("date") or raw.get("start_date")),
         "due_date": _safe_date_str(raw.get("deadline") or raw.get("due_date")),
         "completed_date": str(raw.get("completed_date") or ""),
         "description": str(raw.get("description") or ""),
-        "client_company": str(raw.get("company_name") or ""),
-        "project_type": str(raw.get("project_type") or raw.get("c_projecttype") or ""),
-        "client_country": str(raw.get("c_clientcountry") or ""),
-        "business_area": str(raw.get("c_businessarea") or ""),
-        "business_line_division": str(raw.get("c_businesslinedivision") or ""),
-        "budget_type": str(raw.get("budget_type") or raw.get("c_budgettype") or ""),
-        "po_number": str(raw.get("c_ponumber") or ""),
-        "open_po_number": str(raw.get("c_openponr") or ""),
-        "related_project": str(raw.get("c_relatedproject") or ""),
-        "google_drive_link": str(raw.get("c_drivelink") or ""),
-        "project_priority": str(raw.get("c_project_priority") or ""),
+        "client_company": client_company,
+        "project_type": custom("c_projecttype") or str(raw.get("project_type") or ""),
+        "client_country": custom("c_clientcountry"),
+        "business_area": custom("c_businessarea"),
+        "business_line_division": custom("c_businesslinedivision"),
+        "budget_type": custom("c_budgettype") or str(raw.get("budget_type") or ""),
+        "po_number": custom("c_ponumber"),
+        "open_po_number": custom("c_openponr"),
+        "related_project": custom("c_relatedproject"),
+        "google_drive_link": custom("c_gdrivelink") or custom("c_drivelink"),
+        "project_priority": custom("c_project_priority"),
+        "tags": tags,
     }
 
 
@@ -660,11 +806,12 @@ def upsert_projects(rows: list[dict]):
     # (e.g. numeric-looking scoro_id as INT64). Dates are cast in the MERGE.
     string_fields = [
         "project_id", "scoro_id", "project_no", "project_name", "status",
-        "project_manager", "project_members", "start_date", "due_date",
+        "status_name", "project_manager", "project_manager_name",
+        "project_members", "start_date", "due_date",
         "completed_date", "description", "client_company", "project_type",
         "client_country", "business_area", "business_line_division",
         "budget_type", "po_number", "open_po_number", "related_project",
-        "google_drive_link", "project_priority",
+        "google_drive_link", "project_priority", "tags",
     ]
     schema = [bigquery.SchemaField(f, "STRING") for f in string_fields]
 
@@ -684,7 +831,9 @@ def upsert_projects(rows: list[dict]):
             project_no           = S.project_no,
             project_name         = S.project_name,
             status               = S.status,
+            status_name          = S.status_name,
             project_manager      = S.project_manager,
+            project_manager_name = S.project_manager_name,
             project_members      = S.project_members,
             start_date           = SAFE.PARSE_DATE('%Y-%m-%d', S.start_date),
             due_date             = SAFE.PARSE_DATE('%Y-%m-%d', S.due_date),
@@ -701,25 +850,26 @@ def upsert_projects(rows: list[dict]):
             related_project      = S.related_project,
             google_drive_link    = S.google_drive_link,
             project_priority     = S.project_priority,
+            tags                 = S.tags,
             imported_at          = CURRENT_TIMESTAMP()
         WHEN NOT MATCHED THEN INSERT (
-            project_id, scoro_id, project_no, project_name, status,
-            project_manager, project_members,
+            project_id, scoro_id, project_no, project_name, status, status_name,
+            project_manager, project_manager_name, project_members,
             start_date, due_date, completed_date, description,
             client_company, project_type, client_country,
             business_area, business_line_division, budget_type,
             po_number, open_po_number, related_project,
-            google_drive_link, project_priority, imported_at
+            google_drive_link, project_priority, tags, imported_at
         ) VALUES (
-            S.project_id, S.scoro_id, S.project_no, S.project_name, S.status,
-            S.project_manager, S.project_members,
+            S.project_id, S.scoro_id, S.project_no, S.project_name, S.status, S.status_name,
+            S.project_manager, S.project_manager_name, S.project_members,
             SAFE.PARSE_DATE('%Y-%m-%d', S.start_date),
             SAFE.PARSE_DATE('%Y-%m-%d', S.due_date),
             S.completed_date, S.description,
             S.client_company, S.project_type, S.client_country,
             S.business_area, S.business_line_division, S.budget_type,
             S.po_number, S.open_po_number, S.related_project,
-            S.google_drive_link, S.project_priority, CURRENT_TIMESTAMP()
+            S.google_drive_link, S.project_priority, S.tags, CURRENT_TIMESTAMP()
         )
         """).result()
     finally:
@@ -731,8 +881,11 @@ def scoro_sync():
     started_at = now_iso()
 
     try:
+        ensure_schema()
+        user_cache = get_scoro_user_cache()
+        company_cache = get_scoro_company_cache()
         all_raw = fetch_all_scoro_projects()
-        normalized = [normalize_scoro_project(p) for p in all_raw]
+        normalized = [normalize_scoro_project(p, user_cache, company_cache) for p in all_raw]
         upsert_projects(normalized)
 
         status_counts: dict[str, int] = {}
@@ -816,7 +969,7 @@ def _get_impersonated_token(user_email: str) -> str:
     Prerequisites:
       1. The runtime service account has roles/iam.serviceAccountTokenCreator on itself.
       2. A Workspace Super Admin authorized the SA's client ID for the
-         cloud-platform scope under Admin Console → Security → API Controls →
+         cloud-platform scope under Admin Console â†’ Security â†’ API Controls â†’
          Domain-wide Delegation.
     """
     global _impersonated_token, _impersonated_token_exp
@@ -930,39 +1083,74 @@ def search_discovery_engine(query: str, page_size: int = 10) -> list[dict]:
     if not resp.ok:
         # Surface the actual API error message instead of a generic HTTPError
         raise RuntimeError(
-            f"Discovery Engine search failed: HTTP {resp.status_code} — {resp.text[:800]} "
+            f"Discovery Engine search failed: HTTP {resp.status_code} â€” {resp.text[:800]} "
             f"(query={query!r})"
         )
 
     return resp.json().get("results", [])
 
 
+def _strip_name_suffixes(project_name: str) -> str:
+    """
+    Scoro project names follow {Deliverable}_{ClientContact}_{AdmindEmployee},
+    e.g. "ABB IR 26 Website_Diana Silander_Flisikowska A". Sending the person
+    names to Discovery Engine routes queries to org charts and HR documents
+    (audit Â§4.1). Keep the deliverable part, drop trailing person-name segments.
+    """
+    if not project_name:
+        return project_name
+    parts = [p.strip() for p in project_name.split("_") if p.strip()]
+    if len(parts) <= 1:
+        return project_name
+
+    # A segment "looks like a person" when it is 1â€“3 capitalised words with no
+    # digits (e.g. "Diana Silander", "Flisikowska A", "Czerw D").
+    person_re = re.compile(r"^(?:[A-ZĹĹ»ĹšÄ†][\w'â€™.-]*)(?:\s+[A-ZĹĹ»ĹšÄ†][\w'â€™.-]*){0,2}$")
+
+    kept = [parts[0]]
+    for seg in parts[1:]:
+        words = seg.split()
+        looks_like_person = (
+            1 <= len(words) <= 3
+            and not any(ch.isdigit() for ch in seg)
+            and person_re.match(seg) is not None
+        )
+        if not looks_like_person:
+            kept.append(seg)
+    return " ".join(kept)
+
+
 def build_project_queries(project) -> list[str]:
     """
     Build several complementary search queries per project. Discovery Engine is
-    search-based, so multiple angles (name+number, client+type, cleaned name,
-    drive link) retrieve far more relevant candidates than one combined string.
+    search-based, so multiple angles (number, cleaned name, client+type+tags)
+    retrieve far more relevant candidates than one combined string.
     """
     project_name = _row(project, "project_name")
     project_no = _row(project, "project_no")
     client = _row(project, "client_company")
     project_type = _row(project, "project_type")
     business_area = _row(project, "business_area")
+    tags = _row(project, "tags")
     description = _row(project, "description")
-    drive = _row(project, "google_drive_link")
+
+    clean_name = _strip_name_suffixes(project_name)
 
     queries: list[str] = []
 
-    if project_name and project_no:
-        queries.append(f'"{project_name}" "{project_no}"')
-    if client and project_type:
-        queries.append(" ".join(p for p in [client, project_type, business_area] if p))
-    if project_name:
-        queries.append(project_name.replace("_", " "))
+    # Project number is the single most precise signal Admind uses in filenames.
+    if project_no:
+        queries.append(str(project_no))
+    if clean_name and project_no:
+        queries.append(f'"{clean_name}" {project_no}')
+    if clean_name:
+        queries.append(clean_name)
+    if client and clean_name:
+        queries.append(f"{client} {clean_name}")
+    if client and (project_type or tags):
+        queries.append(" ".join(p for p in [client, project_type, tags, business_area] if p))
     if client and description:
         queries.append(f"{client} {description[:200]}")
-    if drive:
-        queries.append(drive)
 
     # Deduplicate while preserving order.
     seen, unique = set(), []
@@ -1030,8 +1218,8 @@ def _extract_document(item: dict) -> dict | None:
 def discover_documents_for_project(project) -> tuple[list[dict], list[dict]]:
     """
     Returns (documents, candidates).
-    documents  → rows for the global documents table (deduped by document_id).
-    candidates → per-project link rows (project_id, document_id, rank, query…).
+    documents  â†’ rows for the global documents table (deduped by document_id).
+    candidates â†’ per-project link rows (project_id, document_id, rank, queryâ€¦).
     """
     queries = build_project_queries(project)
     if not queries:
@@ -1176,7 +1364,7 @@ def document_discovery():
 
     try:
         ensure_schema()
-        projects = get_projects_for_processing(limit=int(os.getenv("PROJECT_LIMIT", "20")))
+        projects = get_projects_for_processing(limit=int(os.getenv("PROJECT_LIMIT", "100")))
         failures = 0
         for project in projects:
             name = _row(project, "project_name") or _row(project, "project_id")
@@ -1185,14 +1373,14 @@ def document_discovery():
                 upsert_documents(docs)
                 upsert_document_candidates(candidates, run_id)
                 total_discovered += len(candidates)
-                logger.info("document-discovery: %s → %d docs / %d candidates",
+                logger.info("document-discovery: %s â†’ %d docs / %d candidates",
                             name, len(docs), len(candidates))
             except Exception as e:
                 failures += 1
                 logger.error("document-discovery: project %s failed: %s", name, e)
 
         if total_discovered == 0 and failures > 0:
-            # Every project failed — surface the problem instead of reporting success
+            # Every project failed â€” surface the problem instead of reporting success
             raise RuntimeError(f"document-discovery: all {failures} project searches failed")
 
         logger.info(json.dumps({
@@ -1239,6 +1427,8 @@ def classify_documents_for_project(project, documents) -> list[dict]:
 
     project_type = _row(project, "project_type")
     business_area = _row(project, "business_area")
+    tags = _row(project, "tags")
+    clean_name = _strip_name_suffixes(project_name)
 
     prompt = f"""
 You are a project-document taxonomy classifier for Admind Agency, a creative branding studio.
@@ -1247,12 +1437,19 @@ Decide whether each candidate document belongs to the project below.
 Project metadata:
 - Project number: {project_no}
 - Project name: {project_name}
+- Deliverable (project name without person-name suffixes): {clean_name}
 - Client/company: {client_company}
 - Project type: {project_type}
 - Business area: {business_area}
+- Tags: {tags}
 - Team: {project_members}
 - Period: {start_date} to {due_date}
 - Description: {description}
+
+Naming convention: Admind project names follow
+{{Deliverable}}_{{ClientContact}}_{{AdmindEmployee}} and filenames usually start
+with the project number (e.g. "566508_..."). The project NUMBER and the
+DELIVERABLE are the strongest evidence.
 
 Classification rules:
 - strong_match: title/path/content clearly references this project, its number,
@@ -1262,9 +1459,16 @@ Classification rules:
 - reject: generic, unrelated, or only weakly matching.
 
 Guidance:
-- Prefer project number, exact project name, and client name + deliverable as evidence.
-- Do NOT treat generic brand guidelines as project-specific unless the project is
-  about that exact brand guideline.
+- Prefer project number, exact deliverable name, and client name + deliverable as evidence.
+- REJECT org charts, HR documents, employee/holiday lists, timesheets, CVs and
+  other internal-operations documents. A match on an employee's name alone is
+  NOT evidence â€” every Admind employee appears in hundreds of unrelated files.
+- REJECT documents that clearly belong to a DIFFERENT project number, even for
+  the same client (e.g. a file titled "566123_..." is not evidence for 566508).
+- REJECT generic client material (brand guidelines, old case studies, other
+  campaigns) unless this project is specifically about that material.
+- Personal handover files (e.g. "Handover_<employee>.xlsx") belong to a project
+  ONLY if the handover content is about this specific project's deliverable.
 - If evidence is weak, use possible_match, not strong_match.
 
 Return ONLY valid JSON with this exact shape:
@@ -1294,14 +1498,13 @@ Documents:
 
 
 def _match_passes(m: dict) -> bool:
-    """Keep strong matches ≥0.75 and possible matches ≥0.55 (rejects dropped)."""
+    """Keep strong and possible matches at â‰Ą0.75 (rejects dropped)."""
     decision = (m.get("decision") or "").lower()
     score = float(m.get("confidence_score", 0) or 0)
     if decision == "reject":
         return False
-    if decision == "possible_match":
-        return score >= 0.55
-    # strong_match or unspecified decision (older prompt behaviour)
+    # Uniform 0.75 floor â€” the old 0.55 floor for possible_match let unrelated
+    # client documents pollute the wikis (audit Â§4.2).
     return score >= 0.75
 
 
@@ -1315,7 +1518,7 @@ def taxonomy_sync():
 
     try:
         ensure_schema()
-        projects = get_projects_for_processing(limit=int(os.getenv("PROJECT_LIMIT", "20")))
+        projects = get_projects_for_processing(limit=int(os.getenv("PROJECT_LIMIT", "100")))
 
         for project in projects:
             project_id = _row(project, "project_id")
@@ -1382,9 +1585,18 @@ def generate_wiki_for_project(project_id: str):
     project_name = _row(project, "project_name")
     project_no = _row(project, "project_no") or project_id
     client_company = _row(project, "client_company")
+    project_manager = _row(project, "project_manager_name") or _row(project, "project_manager")
     project_members = _row(project, "project_members")
     project_type = _row(project, "project_type")
     business_area = _row(project, "business_area")
+    business_division = _row(project, "business_line_division")
+    client_country = _row(project, "client_country")
+    tags = _row(project, "tags")
+    status_name = _row(project, "status_name") or _row(project, "status")
+    budget_type = _row(project, "budget_type")
+    po_number = _row(project, "po_number")
+    drive_link = _row(project, "google_drive_link")
+    priority = _row(project, "project_priority")
     start_date = _row(project, "start_date")
     due_date = _row(project, "due_date")
     description = _row(project, "description")
@@ -1394,19 +1606,52 @@ def generate_wiki_for_project(project_id: str):
         "project_name": project_name,
         "project_no": project_no,
         "client_company": client_company,
+        "project_manager": str(project_manager or ""),
         "project_members": project_members,
+        "status_name": str(status_name or ""),
+        "tags": str(tags or ""),
+        "business_area": str(business_area or ""),
+        "client_country": str(client_country or ""),
+        "google_drive_link": str(drive_link or ""),
         "generated_at": firestore.SERVER_TIMESTAMP,
         "source_document_ids": [_row(doc, "document_id") for doc in docs],
     }
 
-    # No mapped sources → store a placeholder WITHOUT calling the LLM, so we
-    # never produce shallow "Not found in available sources" pages.
+    # No mapped sources â†’ build a factual page from the Scoro record alone
+    # (no LLM call), so the page is still useful instead of an empty shell.
     if not docs:
-        placeholder = (
-            f"# {project_name}\n\n"
-            f"_No source documents have been mapped to this project yet._\n\n"
-            f"Run document discovery and taxonomy sync to populate this page."
+        lines = [f"# {project_name}", ""]
+        intro_bits = []
+        if client_company:
+            intro_bits.append(f"for **{client_company}**")
+        if project_type:
+            intro_bits.append(f"({project_type})")
+        lines.append(
+            f"Admind runs project **{project_no}** {' '.join(intro_bits)}".strip() + "."
         )
+        if description:
+            lines += ["", description]
+        facts = []
+        if status_name:
+            facts.append(f"- **Status:** {status_name}")
+        if start_date or due_date:
+            facts.append(f"- **Period:** {start_date or 'â€”'} â†’ {due_date or 'ongoing'}")
+        if project_manager:
+            facts.append(f"- **Project manager:** {project_manager}")
+        if project_members:
+            facts.append(f"- **Team:** {project_members}")
+        if business_area:
+            facts.append(f"- **Business area:** {business_area}")
+        if client_country:
+            facts.append(f"- **Client country:** {client_country}")
+        if tags:
+            facts.append(f"- **Tags:** {tags}")
+        if drive_link and str(drive_link).lower().startswith("http"):
+            facts.append(f"- **Project folder:** [Google Drive]({drive_link})")
+        if facts:
+            lines += ["", "## Overview", ""] + facts
+        lines += ["", "_Document intelligence for this project is still being indexed._"]
+        placeholder = "\n".join(lines)
         _store_wiki_markdown(project_id, {
             **base_doc,
             "wiki_status": "no_sources",
@@ -1421,63 +1666,116 @@ def generate_wiki_for_project(project_id: str):
         }))
         return
 
+    def _clickable(url: str) -> str:
+        """Only http(s) links are usable by readers; gs:// connector URIs are not."""
+        u = str(url or "").strip()
+        return u if u.lower().startswith(("http://", "https://")) else ""
+
     source_docs = [
         {
             "document_id": _row(doc, "document_id"),
             "title": _row(doc, "title"),
-            "url": _row(doc, "source_url") or _row(doc, "url"),
+            "url": _clickable(_row(doc, "source_url")) or _clickable(_row(doc, "url")),
             "content": (_row(doc, "full_text") or _row(doc, "text_preview") or "")[:wiki_char_limit],
         }
         for doc in docs
     ]
 
     prompt = f"""
-You are an internal project intelligence documentarian for Admind Agency, a creative branding studio.
-Create a DeepWiki-style internal project page.
+You are a senior account manager at Admind Agency, a creative branding studio.
+You are writing the internal knowledge-base page for one project. Your reader is
+a colleague who needs to take over or support this project tomorrow â€” give them
+everything you know, clearly organised, the way deepwiki.com describes a codebase.
 
-Project:
+PROJECT RECORD (from Scoro â€” this data is verified, use it freely):
 - Project number: {project_no}
 - Project name: {project_name}
-- Client/company: {client_company}
-- Team: {project_members}
+- Client: {client_company}
+- Client country: {client_country}
+- Status: {status_name}
+- Project manager: {project_manager}
+- Team members: {project_members}
 - Period: {start_date} to {due_date}
 - Project type: {project_type}
 - Business area: {business_area}
+- Business line / division: {business_division}
+- Tags: {tags}
+- Budget type: {budget_type}
+- PO number: {po_number}
+- Priority: {priority}
+- Google Drive folder: {drive_link}
 - Description: {description}
 
-Use ONLY the source documents below. Do not invent facts.
-If information is missing, write "Not found in available sources."
-
-Write Markdown with these sections:
-## Executive Summary
-5–8 bullet points: what this project is, why it exists, current state.
-## Project Scope
-Deliverables, channels, brand/campaign scope, markets, workstreams.
-## Brief & Objectives
-Business objectives and creative objectives, stated separately.
-## Timeline
-Dates, milestones, approvals, meetings, delivery moments.
-## Team & Stakeholders
-Admind team, client stakeholders, external partners (separated if available).
-## Key Decisions
-Decisions with source citations.
-## Design Assets & Deliverables
-Files/assets found, with document titles and URLs where available.
-## Meeting Intelligence
-Meeting notes, decisions, open questions, blockers, next steps.
-## Risks, Gaps & Unknowns
-Missing documents, unclear ownership, low confidence, incomplete coverage.
-## Source Map
-A table: | Source | Type | Why it matters | URL |
-
-Citation rule: for every factual claim, cite the document title in parentheses,
-e.g. "The project focuses on a website refresh (KI Website Refresh Pitch 2025.pptx)."
-
-Source documents:
+SOURCE DOCUMENTS (verbatim extracts â€” your only other evidence):
 {json.dumps(source_docs, ensure_ascii=False)}
+
+WRITING STYLE â€” follow strictly:
+1. Write in direct present tense. State facts immediately.
+   GOOD: "Admind designs and builds the ABB Integrated Report 2026 website for ABB's corporate communications team."
+   BAD:  "This project involves work on a website." / "The project pertains to..."
+2. NEVER open a sentence with "This project", "The project", "It involves" or
+   any vague filler. Name the actual deliverable, client, and people.
+3. Be specific and concrete: name files, people, dates, tools, vendors, and
+   deliverables exactly as they appear in the sources.
+4. Do NOT invent facts. Everything beyond the project record must come from the
+   source documents.
+5. If a section has no substantive information, OMIT THE ENTIRE SECTION.
+   Never write "Not found in available sources", "N/A", "Unknown" or any
+   placeholder. A shorter, denser page is better than a padded one.
+6. Only use information from documents that are genuinely about THIS project
+   (project number {project_no} / this exact deliverable). If a source document
+   is clearly about a different project, ignore it completely.
+
+LINK RULES â€” follow strictly:
+- When citing a document, hyperlink its title: [Document title](url).
+- Use a document's url ONLY if it starts with http:// or https://. If a
+  document has no such url, mention its title in plain text WITHOUT a link and
+  WITHOUT inventing one. Never print a raw URL, a gs:// URI, or a bare filename
+  as link text for a URL.
+- Never paste long raw file paths or URLs into prose.
+
+STRUCTURE â€” use these sections, omitting any that would be empty:
+
+# {project_name}
+
+One opening paragraph (2â€“4 sentences): what Admind delivers, for whom, why, and
+where it stands now. This paragraph is mandatory â€” write it from the project
+record even if sources are thin.
+
+## Overview
+A factual narrative (1â€“3 paragraphs) of the engagement: deliverable, client
+context, scope and current state. Weave in dates, team and tags naturally.
+
+## Deliverables & Scope
+Concrete deliverables, channels, formats, markets, workstreams â€” as a list or
+short table. Only include what the sources support.
+
+## Timeline & Milestones
+Dates, milestones, approvals, delivery moments. Include the Scoro period.
+
+## Team & Stakeholders
+- **Admind:** project manager and team members (from the project record), plus
+  any roles evidenced in sources.
+- **Client:** named client-side stakeholders.
+- **External partners / vendors:** only if evidenced in sources for THIS project.
+
+## Key Decisions & Status
+Decisions, approvals, scope changes â€” each citing its source document.
+
+## Working Materials
+The important files for this project, each as a hyperlinked title (per the link
+rules) with one line on what it contains and why it matters. Skip files without
+substance.
+
+## Open Questions & Risks
+Genuine open items, dependencies, blockers, or gaps a successor must know.
+Omit if there are none worth flagging.
+
+Return ONLY the Markdown page. No preamble, no code fences around the whole page.
 """
 
-    markdown = generate_text(prompt, temperature=0.2, json_mode=False)
+    markdown = generate_text(prompt, temperature=0.2, json_mode=False,
+                             model_name=WIKI_MODEL_NAME)
     model_used = active_llm_label()
     chunks = _split_utf8_chunks(markdown, WIKI_CHUNK_BYTES)
 
@@ -1499,7 +1797,7 @@ Source documents:
 
 def wiki_generate_all():
     """Generate wiki pages only for projects that actually have mapped documents."""
-    rows = get_project_ids_with_mapped_documents(limit=int(os.getenv("PROJECT_LIMIT", "20")))
+    rows = get_project_ids_with_mapped_documents(limit=int(os.getenv("PROJECT_LIMIT", "100")))
     if not rows:
         logger.info(json.dumps({
             "status": "ok", "job": "wiki-generate",
@@ -1534,16 +1832,16 @@ def wiki_generate_all():
         )
 
 # ---------------------------------------------------------------------------
-# FULL SYNC — runs the complete pipeline in order
+# FULL SYNC â€” runs the complete pipeline in order
 # ---------------------------------------------------------------------------
 
 
 def _apply_full_sync_defaults():
     """
-    Defaults for a one-click full pipeline run (Console UI → Execute).
+    Defaults for a one-click full pipeline run (Console UI â†’ Execute).
 
-    - SCORO_PROJECT_MODE=all  → import the full Scoro catalog (all statuses)
-    - PROJECT_MODE=active     → discovery / taxonomy / wiki on open projects only
+    - SCORO_PROJECT_MODE=all  â†’ import the full Scoro catalog (all statuses)
+    - PROJECT_MODE=active     â†’ discovery / taxonomy / wiki on open projects only
     """
     defaults = {
         "SCORO_PROJECT_MODE": "all",
@@ -1557,7 +1855,7 @@ def _apply_full_sync_defaults():
         "event": "full-sync-config",
         "scoro_project_mode": os.getenv("SCORO_PROJECT_MODE"),
         "project_mode": os.getenv("PROJECT_MODE"),
-        "project_limit": os.getenv("PROJECT_LIMIT", "20"),
+        "project_limit": os.getenv("PROJECT_LIMIT", "100"),
         "document_limit": os.getenv("DOCUMENT_LIMIT", "25"),
         "candidate_limit": os.getenv("CANDIDATE_LIMIT", "50"),
     }))
@@ -1593,7 +1891,7 @@ def full_sync():
 
 
 def historical_full_sync():
-    """Full pipeline over ALL projects (incl. completed) — for backfill runs."""
+    """Full pipeline over ALL projects (incl. completed) â€” for backfill runs."""
     os.environ["SCORO_PROJECT_MODE"] = "all"
     os.environ["PROJECT_MODE"] = "all"
     logger.info("historical-full-sync: forcing SCORO_PROJECT_MODE=all, PROJECT_MODE=all")
@@ -1606,7 +1904,7 @@ def run_job(job: str):
         "job_type": job,
         "scoro_project_mode": os.getenv("SCORO_PROJECT_MODE", "active"),
         "project_mode": os.getenv("PROJECT_MODE", "active"),
-        "project_limit": os.getenv("PROJECT_LIMIT", "20"),
+        "project_limit": os.getenv("PROJECT_LIMIT", "100"),
     }))
 
     dispatch = {

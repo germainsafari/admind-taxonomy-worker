@@ -24,7 +24,7 @@ steps:
     args:
       - -c
       - |
-        ENV_VARS="PROJECT_ID=admind-data-organisation,DATASET=admind_data_organisation,LOCATION=europe-west4,FIRESTORE_DATABASE=admindfirestore,MODEL_NAME=gemini-2.5-flash,LLM_PROVIDER=auto,JOB_TYPE=full-sync,SCORO_PROJECT_MODE=all,PROJECT_MODE=active,PROJECT_LIMIT=20,DOCUMENT_LIMIT=25,CANDIDATE_LIMIT=50,SCORO_BASE_URL=https://admindagency.scoro.com,SCORO_COMPANY_ACCOUNT_ID=admindagency,DISCOVERY_ENGINE_PROJECT_NUMBER=493121771508,DISCOVERY_ENGINE_LOCATION=global,DISCOVERY_ENGINE_COLLECTION=default_collection,DISCOVERY_ENGINE_ENGINE_ID=gemini-enterprise-admind,DISCOVERY_ENGINE_SERVING_CONFIG=default_search,DISCOVERY_IMPERSONATE_USER=germain.safari@admindagency.com,WIKI_MAX_SOURCE_DOCS=30,WIKI_SOURCE_CHARS=12000,SCORO_PER_PAGE=100"
+        ENV_VARS="PROJECT_ID=admind-data-organisation,DATASET=admind_data_organisation,LOCATION=europe-west4,FIRESTORE_DATABASE=admindfirestore,MODEL_NAME=gemini-2.5-flash,WIKI_MODEL_NAME=gemini-2.5-pro,LLM_PROVIDER=auto,JOB_TYPE=full-sync,SCORO_PROJECT_MODE=all,PROJECT_MODE=active,PROJECT_LIMIT=100,DOCUMENT_LIMIT=25,CANDIDATE_LIMIT=50,SCORO_BASE_URL=https://admindagency.scoro.com,SCORO_COMPANY_ACCOUNT_ID=admindagency,DISCOVERY_ENGINE_PROJECT_NUMBER=493121771508,DISCOVERY_ENGINE_LOCATION=global,DISCOVERY_ENGINE_COLLECTION=default_collection,DISCOVERY_ENGINE_ENGINE_ID=gemini-enterprise-admind,DISCOVERY_ENGINE_SERVING_CONFIG=default_search,DISCOVERY_IMPERSONATE_USER=germain.safari@admindagency.com,WIKI_MAX_SOURCE_DOCS=30,WIKI_SOURCE_CHARS=12000,SCORO_PER_PAGE=100"
         SECRETS="GEMINI_API_KEY=gemini-api-key:latest,OPENAI_API_KEY=openai-api-key:latest,SCORO_API_KEY=scoro-api-token:latest"
 
         gcloud run jobs update admind-taxonomy-worker \

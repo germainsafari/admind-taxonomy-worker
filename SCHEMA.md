@@ -14,8 +14,10 @@ Cleaned/normalised project records upserted from Scoro via `scoro-sync`.
 | `scoro_id` | STRING | Numeric Scoro project ID as string |
 | `project_no` | STRING | Scoro project number / code (e.g. "566170") |
 | `project_name` | STRING | Project display name |
-| `status` | STRING | e.g. inprogress, done, cancelled |
+| `status` | STRING | Scoro internal status code, e.g. pending, inprogress, done |
+| `status_name` | STRING | Human-readable Scoro status label (e.g. "In progress") |
 | `project_manager` | STRING | Full name of project manager |
+| `project_manager_name` | STRING | Resolved manager name (same as project_manager) |
 | `project_members` | STRING | Comma-separated team member names |
 | `start_date` | DATE | Project start date |
 | `due_date` | DATE | Project deadline |
@@ -32,6 +34,7 @@ Cleaned/normalised project records upserted from Scoro via `scoro-sync`.
 | `related_project` | STRING | Related project reference |
 | `google_drive_link` | STRING | Google Drive folder URL |
 | `project_priority` | STRING | Priority level |
+| `tags` | STRING | Comma-separated Scoro tags |
 | `imported_at` | TIMESTAMP | Last upserted timestamp |
 
 ---
