@@ -286,7 +286,8 @@ def ensure_schema():
     ALTER TABLE `{PROJECT_ID}.{DATASET}.projects`
     ADD COLUMN IF NOT EXISTS status_name STRING,
     ADD COLUMN IF NOT EXISTS tags STRING,
-    ADD COLUMN IF NOT EXISTS project_manager_name STRING
+    ADD COLUMN IF NOT EXISTS project_manager_name STRING,
+    ADD COLUMN IF NOT EXISTS client_contacts STRING
     """).result()
 
     _schema_ready = True
@@ -589,9 +590,15 @@ def fetch_scoro_projects_page(
     page: int = 1,
     per_page: int = 100,
     status: str | None = None,
+    *,
+    detailed: bool = False,
 ) -> list[dict]:
     """Fetch one page of projects, optionally filtered by status."""
+    if detailed:
+        per_page = min(per_page, 25)
     body: dict = {"page": page, "per_page": per_page}
+    if detailed:
+        body["detailed_response"] = True
     if status:
         body["filter"] = {"status": status}
     data = _scoro_post("projects/list", body)
@@ -600,7 +607,10 @@ def fetch_scoro_projects_page(
 
 def fetch_all_scoro_projects() -> list[dict]:
     """Paginate through every configured status and deduplicate by project_id."""
+    detailed = os.getenv("SCORO_DETAILED_RESPONSE", "1") == "1"
     per_page = int(os.getenv("SCORO_PER_PAGE", "100"))
+    if detailed:
+        per_page = min(per_page, 25)
     statuses = _scoro_statuses_to_fetch()
     seen_ids: set = set()
     all_raw: list[dict] = []
@@ -608,7 +618,9 @@ def fetch_all_scoro_projects() -> list[dict]:
     for status in statuses:
         page, status_count = 1, 0
         while True:
-            batch = fetch_scoro_projects_page(page=page, per_page=per_page, status=status)
+            batch = fetch_scoro_projects_page(
+                page=page, per_page=per_page, status=status, detailed=detailed,
+            )
             if not batch:
                 break
             for project in batch:
@@ -640,15 +652,31 @@ def _safe_date_str(val) -> str | None:
 
 _scoro_user_cache: dict[str, str] | None = None
 _scoro_company_cache: dict[str, str] | None = None
+_scoro_contact_cache: dict[str, str] | None = None
 
 
-def _fetch_scoro_list(endpoint: str, body_extra: dict | None = None) -> list[dict]:
+def _scoro_throttle():
+    ms = int(os.getenv("SCORO_ENRICH_SLEEP_MS", "30"))
+    if ms > 0:
+        time.sleep(ms / 1000.0)
+
+
+def _fetch_scoro_list(
+    endpoint: str,
+    body_extra: dict | None = None,
+    *,
+    detailed: bool = False,
+) -> list[dict]:
     """Paginate through a Scoro list endpoint and return every row."""
     per_page = int(os.getenv("SCORO_PER_PAGE", "100"))
+    if detailed:
+        per_page = min(per_page, 25)
     rows: list[dict] = []
     page = 1
     while True:
-        body = {"page": page, "per_page": per_page}
+        body: dict = {"page": page, "per_page": per_page}
+        if detailed:
+            body["detailed_response"] = True
         if body_extra:
             body.update(body_extra)
         data = _scoro_post(endpoint, body)
@@ -658,6 +686,89 @@ def _fetch_scoro_list(endpoint: str, body_extra: dict | None = None) -> list[dic
             break
         page += 1
     return rows
+
+
+def fetch_scoro_project_view(scoro_id: str) -> dict:
+    """Full project record — includes project_users, custom_fields, tags."""
+    data = _scoro_post(f"projects/view/{scoro_id}", {})
+    row = data.get("data")
+    return row if isinstance(row, dict) else {}
+
+
+def fetch_scoro_project_related(
+    scoro_id: str,
+    modules: list[str] | None = None,
+) -> dict:
+    """Related users, contacts, and companies linked to a project."""
+    req: dict = {}
+    if modules:
+        req["modules"] = modules
+    data = _scoro_post(f"projects/getRelatedObjects/{scoro_id}", {"request": req})
+    row = data.get("data")
+    return row if isinstance(row, dict) else {}
+
+
+def _merge_project_detail(base: dict, detail: dict) -> dict:
+    """Overlay view/detailed fields onto a list row without dropping list data."""
+    out = dict(base)
+    for key, val in detail.items():
+        if key in ("customFields", "custom_fields") and isinstance(val, dict):
+            existing = out.get("customFields") or out.get("custom_fields") or {}
+            if isinstance(existing, dict):
+                out["customFields"] = {**existing, **val}
+            else:
+                out["customFields"] = val
+        elif val not in (None, "", [], {}):
+            out[key] = val
+    return out
+
+
+def _parse_name_contact_hints(project_name: str) -> tuple[str, str]:
+    """
+    Scoro names often follow {Deliverable}_{ClientContact}_{AdmindEmployee}.
+    Returns (client_contact_hint, admind_employee_hint).
+    """
+    parts = [p.strip() for p in (project_name or "").split("_") if p.strip()]
+    if len(parts) >= 3:
+        return parts[1], parts[2]
+    if len(parts) == 2:
+        return parts[1], ""
+    return "", ""
+
+
+def _contact_display(contact: dict) -> str:
+    ctype = str(contact.get("contact_type") or "").lower()
+    if ctype == "person":
+        name = str(
+            contact.get("search_name")
+            or " ".join(
+                p for p in [contact.get("name"), contact.get("lastname")] if p
+            ).strip()
+        )
+        pos = str(contact.get("position") or "").strip()
+        return f"{name} ({pos})" if name and pos else name
+    return str(contact.get("name") or contact.get("search_name") or "").strip()
+
+
+def get_scoro_contact_cache() -> dict[str, str]:
+    """contact_id → display name (persons and companies)."""
+    global _scoro_contact_cache
+    if _scoro_contact_cache is not None:
+        return _scoro_contact_cache
+    cache: dict[str, str] = {}
+    try:
+        for c in _fetch_scoro_list("contacts/list"):
+            cid = str(c.get("contact_id") or c.get("id") or "")
+            label = _contact_display(c) if c.get("contact_type") == "person" else str(
+                c.get("name") or ""
+            ).strip()
+            if cid and label:
+                cache[cid] = label
+    except Exception as e:
+        logger.warning("scoro-sync: could not build contact cache: %s", e)
+    _scoro_contact_cache = cache
+    logger.info("scoro-sync: contact cache built with %d contacts", len(cache))
+    return cache
 
 
 def get_scoro_user_cache() -> dict[str, str]:
@@ -703,33 +814,226 @@ def get_scoro_company_cache() -> dict[str, str]:
         name = str(c.get("name") or c.get("company_name") or "").strip()
         if cid and name:
             cache[cid] = name
+    # Also index company-type contacts from the full contacts list.
+    try:
+        for c in _fetch_scoro_list("contacts/list", {"filter": {"contact_type": "company"}}):
+            cid = str(c.get("contact_id") or c.get("id") or "")
+            name = str(c.get("name") or "").strip()
+            if cid and name:
+                cache[cid] = name
+    except Exception:
+        pass
     _scoro_company_cache = cache
     logger.info("scoro-sync: company cache built with %d companies", len(cache))
     return cache
 
 
-def _resolve_members(raw: dict, user_cache: dict[str, str]) -> str:
-    """Resolve the project's members[] ID list to comma-separated names."""
-    members = raw.get("members") or raw.get("project_users") or []
-    if not isinstance(members, (list, tuple)):
-        return ""
-    names = []
-    for m in members:
-        mid = str(m.get("user_id") or m.get("id") or m) if isinstance(m, dict) else str(m)
-        name = user_cache.get(mid)
-        if name and name not in names:
-            names.append(name)
+def _resolve_project_team(
+    raw: dict,
+    user_cache: dict[str, str],
+    related: dict | None = None,
+) -> str:
+    """All Admind people on the project: project_users, manager, related users."""
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(name: str):
+        n = str(name or "").strip()
+        if not n or n in seen:
+            return
+        seen.add(n)
+        names.append(n)
+
+    for source in (raw.get("project_users"), raw.get("members"), raw.get("project_users_list")):
+        if not isinstance(source, (list, tuple)):
+            continue
+        for entry in source:
+            if isinstance(entry, dict):
+                uid = str(entry.get("user_id") or entry.get("id") or "")
+                add(
+                    entry.get("full_name")
+                    or entry.get("name")
+                    or user_cache.get(uid)
+                    or entry.get("email")
+                    or uid
+                )
+            else:
+                uid = str(entry)
+                add(user_cache.get(uid) or uid)
+
+    manager_id = str(raw.get("managerId") or raw.get("manager_id") or "")
+    if manager_id:
+        add(user_cache.get(manager_id) or str(raw.get("manager_email") or ""))
+
+    _, admind_hint = _parse_name_contact_hints(str(raw.get("project_name") or ""))
+    if admind_hint:
+        add(admind_hint)
+
+    if related:
+        users_mod = related.get("users") or {}
+        for user in users_mod.get("items") or []:
+            if not isinstance(user, dict):
+                continue
+            add(
+                user.get("full_name")
+                or " ".join(
+                    p for p in [user.get("firstname"), user.get("lastname")] if p
+                ).strip()
+                or user.get("email")
+            )
+
     return ", ".join(names)
+
+
+def _resolve_client_info(
+    raw: dict,
+    company_cache: dict[str, str],
+    contact_cache: dict[str, str],
+    related: dict | None = None,
+) -> tuple[str, str]:
+    """Return (client_company, client_contacts) from every available Scoro source."""
+    cf = raw.get("customFields") or raw.get("custom_fields") or {}
+
+    def custom(key: str) -> str:
+        val = cf.get(key)
+        if val is None:
+            val = raw.get(key)
+        if isinstance(val, (list, tuple)):
+            return ", ".join(str(v) for v in val if v)
+        return str(val or "")
+
+    company_id = str(raw.get("company_id") or custom("c_clientcompany") or "")
+    client_company = str(raw.get("company_name") or "").strip()
+    if not client_company and company_id:
+        client_company = company_cache.get(company_id) or contact_cache.get(company_id) or ""
+
+    client_contacts: list[str] = []
+    seen_contacts: set[str] = set()
+
+    def add_contact(label: str):
+        n = str(label or "").strip()
+        if not n or n in seen_contacts:
+            return
+        seen_contacts.add(n)
+        client_contacts.append(n)
+
+    client_hint, _ = _parse_name_contact_hints(str(raw.get("project_name") or ""))
+    if client_hint:
+        add_contact(client_hint)
+
+    if related:
+        for company in (related.get("companies") or {}).get("items") or []:
+            if not isinstance(company, dict):
+                continue
+            name = str(company.get("name") or "").strip()
+            if name and not client_company:
+                client_company = name
+            elif name:
+                add_contact(name)
+        for contact in (related.get("contacts") or {}).get("items") or []:
+            if isinstance(contact, dict):
+                add_contact(_contact_display(contact))
+
+    return client_company, ", ".join(client_contacts)
+
+
+def _scoro_enrich_in_scope(raw: dict) -> bool:
+    scope = os.getenv("SCORO_ENRICH_SCOPE", "active").lower()
+    if scope == "all":
+        return True
+    status = str(raw.get("status") or "").lower()
+    return status in ("inprogress", "pending", "future", "plan")
+
+
+def _project_needs_enrichment(raw: dict, company_cache: dict[str, str]) -> bool:
+    cf = raw.get("customFields") or raw.get("custom_fields") or {}
+    company_id = str(raw.get("company_id") or cf.get("c_clientcompany") or "")
+    has_client = bool(
+        str(raw.get("company_name") or "").strip()
+        or (company_id and company_cache.get(company_id))
+    )
+    team = raw.get("project_users") or raw.get("members") or []
+    team_count = len(team) if isinstance(team, (list, tuple)) else 0
+    has_manager = bool(raw.get("managerId") or raw.get("manager_id"))
+    return not has_client or team_count < 2 or not has_manager
+
+
+def enrich_scoro_project(
+    raw: dict,
+    company_cache: dict[str, str],
+    enrich_budget: list[int],
+) -> tuple[dict, dict]:
+    """
+    Optionally fetch projects/view and getRelatedObjects when list data is thin.
+    enrich_budget is a mutable [remaining_calls] counter shared across the sync run.
+    """
+    if os.getenv("SCORO_ENRICH_PROJECTS", "1") != "1":
+        return raw, {}
+    if not _scoro_enrich_in_scope(raw):
+        return raw, {}
+
+    scoro_id = str(raw.get("project_id") or raw.get("id") or "")
+    if not scoro_id or not _project_needs_enrichment(raw, company_cache):
+        return raw, {}
+
+    if enrich_budget[0] <= 0:
+        return raw, {}
+
+    merged = dict(raw)
+    related: dict = {}
+
+    if os.getenv("SCORO_FETCH_PROJECT_VIEW", "1") == "1" and enrich_budget[0] > 0:
+        try:
+            detail = fetch_scoro_project_view(scoro_id)
+            if detail:
+                merged = _merge_project_detail(merged, detail)
+            enrich_budget[0] -= 1
+            _scoro_throttle()
+        except Exception as e:
+            logger.warning("scoro-sync: projects/view/%s failed: %s", scoro_id, e)
+
+    cf = merged.get("customFields") or merged.get("custom_fields") or {}
+    company_id = str(merged.get("company_id") or cf.get("c_clientcompany") or "")
+    still_no_client = not (
+        str(merged.get("company_name") or "").strip()
+        or (company_id and company_cache.get(company_id))
+    )
+    team = merged.get("project_users") or merged.get("members") or []
+    still_thin_team = (len(team) if isinstance(team, (list, tuple)) else 0) < 2
+
+    if (
+        (still_no_client or still_thin_team)
+        and os.getenv("SCORO_FETCH_RELATED", "1") == "1"
+        and enrich_budget[0] > 0
+    ):
+        try:
+            related = fetch_scoro_project_related(
+                scoro_id, ["users", "contacts", "companies"],
+            )
+            enrich_budget[0] -= 1
+            _scoro_throttle()
+        except Exception as e:
+            logger.warning(
+                "scoro-sync: projects/getRelatedObjects/%s failed: %s", scoro_id, e,
+            )
+
+    if enrich_budget[0] < 0:
+        enrich_budget[0] = 0
+
+    return merged, related
 
 
 def normalize_scoro_project(
     raw: dict,
     user_cache: dict[str, str] | None = None,
     company_cache: dict[str, str] | None = None,
+    contact_cache: dict[str, str] | None = None,
+    related: dict | None = None,
 ) -> dict:
     """Map a Scoro API v2 project object to the BigQuery projects table schema."""
     user_cache = user_cache or {}
     company_cache = company_cache or {}
+    contact_cache = contact_cache or {}
 
     scoro_id = str(raw.get("project_id") or raw.get("id") or "")
 
@@ -753,13 +1057,20 @@ def normalize_scoro_project(
         or manager_id
     )
 
-    # Client company: resolve numeric c_clientcompany / company_id to a name.
-    company_id = str(raw.get("company_id") or custom("c_clientcompany") or "")
-    client_company = (
-        str(raw.get("company_name") or "")
-        or company_cache.get(company_id)
-        or ""
+    # Client company + contacts — multiple Scoro sources (company_id, related objects, name).
+    client_company, client_contacts = _resolve_client_info(
+        raw, company_cache, contact_cache, related,
     )
+    if not client_company:
+        company_id = str(raw.get("company_id") or custom("c_clientcompany") or "")
+        client_company = (
+            str(raw.get("company_name") or "")
+            or company_cache.get(company_id)
+            or contact_cache.get(company_id)
+            or ""
+        )
+
+    project_team = _resolve_project_team(raw, user_cache, related)
 
     tags = raw.get("tags") or []
     if isinstance(tags, (list, tuple)):
@@ -777,12 +1088,13 @@ def normalize_scoro_project(
         "status_name": str(raw.get("statusName") or raw.get("status_name") or ""),
         "project_manager": manager_name,
         "project_manager_name": manager_name,
-        "project_members": _resolve_members(raw, user_cache),
+        "project_members": project_team,
         "start_date": _safe_date_str(raw.get("date") or raw.get("start_date")),
         "due_date": _safe_date_str(raw.get("deadline") or raw.get("due_date")),
         "completed_date": str(raw.get("completed_date") or ""),
         "description": str(raw.get("description") or ""),
         "client_company": client_company,
+        "client_contacts": client_contacts,
         "project_type": custom("c_projecttype") or str(raw.get("project_type") or ""),
         "client_country": custom("c_clientcountry"),
         "business_area": custom("c_businessarea"),
@@ -808,8 +1120,8 @@ def upsert_projects(rows: list[dict]):
         "project_id", "scoro_id", "project_no", "project_name", "status",
         "status_name", "project_manager", "project_manager_name",
         "project_members", "start_date", "due_date",
-        "completed_date", "description", "client_company", "project_type",
-        "client_country", "business_area", "business_line_division",
+        "completed_date", "description", "client_company", "client_contacts",
+        "project_type", "client_country", "business_area", "business_line_division",
         "budget_type", "po_number", "open_po_number", "related_project",
         "google_drive_link", "project_priority", "tags",
     ]
@@ -840,6 +1152,7 @@ def upsert_projects(rows: list[dict]):
             completed_date       = S.completed_date,
             description          = S.description,
             client_company       = S.client_company,
+            client_contacts      = S.client_contacts,
             project_type         = S.project_type,
             client_country       = S.client_country,
             business_area        = S.business_area,
@@ -856,7 +1169,7 @@ def upsert_projects(rows: list[dict]):
             project_id, scoro_id, project_no, project_name, status, status_name,
             project_manager, project_manager_name, project_members,
             start_date, due_date, completed_date, description,
-            client_company, project_type, client_country,
+            client_company, client_contacts, project_type, client_country,
             business_area, business_line_division, budget_type,
             po_number, open_po_number, related_project,
             google_drive_link, project_priority, tags, imported_at
@@ -866,7 +1179,7 @@ def upsert_projects(rows: list[dict]):
             SAFE.PARSE_DATE('%Y-%m-%d', S.start_date),
             SAFE.PARSE_DATE('%Y-%m-%d', S.due_date),
             S.completed_date, S.description,
-            S.client_company, S.project_type, S.client_country,
+            S.client_company, S.client_contacts, S.project_type, S.client_country,
             S.business_area, S.business_line_division, S.budget_type,
             S.po_number, S.open_po_number, S.related_project,
             S.google_drive_link, S.project_priority, S.tags, CURRENT_TIMESTAMP()
@@ -884,8 +1197,17 @@ def scoro_sync():
         ensure_schema()
         user_cache = get_scoro_user_cache()
         company_cache = get_scoro_company_cache()
+        contact_cache = get_scoro_contact_cache()
         all_raw = fetch_all_scoro_projects()
-        normalized = [normalize_scoro_project(p, user_cache, company_cache) for p in all_raw]
+        enrich_budget = [int(os.getenv("SCORO_ENRICH_MAX", "250"))]
+        normalized = []
+        for raw in all_raw:
+            enriched, related = enrich_scoro_project(raw, company_cache, enrich_budget)
+            normalized.append(
+                normalize_scoro_project(
+                    enriched, user_cache, company_cache, contact_cache, related,
+                )
+            )
         upsert_projects(normalized)
 
         status_counts: dict[str, int] = {}
@@ -897,6 +1219,8 @@ def scoro_sync():
             "status": "ok", "job": "scoro-sync",
             "projects_upserted": len(normalized),
             "scoro_project_mode": _scoro_project_mode(),
+            "scoro_detailed_response": os.getenv("SCORO_DETAILED_RESPONSE", "1") == "1",
+            "scoro_enrich_calls_remaining": enrich_budget[0],
             "statuses_queried": _scoro_statuses_to_fetch(),
             "status_breakdown": status_counts,
         }))
@@ -1192,14 +1516,19 @@ def _extract_document(item: dict) -> dict | None:
 
     # url may be an internal gs:// connector URI; source_url is the user-facing
     # link when Discovery Engine provides one.
+    doc_name = str(doc.get("name") or "")
     source_url = (
         derived.get("link")
+        or derived.get("canonicalUrl")
+        or derived.get("sourceUrl")
         or struct.get("link")
         or struct.get("url")
         or struct.get("source_url")
+        or struct.get("canonicalUri")
+        or (doc_name if doc_name.lower().startswith(("http://", "https://")) else "")
         or ""
     )
-    url = source_url or struct.get("uri") or doc.get("name", "") or ""
+    url = source_url or struct.get("uri") or doc_name or ""
 
     return {
         "document_id": document_id,
@@ -1434,7 +1763,9 @@ def classify_documents_for_project(project, documents) -> list[dict]:
     project_name = _row(project, "project_name")
     project_no = _row(project, "project_no")
     client_company = _row(project, "client_company")
+    client_contacts = _row(project, "client_contacts")
     project_members = _row(project, "project_members")
+    project_manager = _row(project, "project_manager_name") or _row(project, "project_manager")
     start_date = _row(project, "start_date")
     due_date = _row(project, "due_date")
     description = _row(project, "description")
@@ -1453,9 +1784,11 @@ Project metadata:
 - Project name: {project_name}
 - Deliverable (project name without person-name suffixes): {clean_name}
 - Client/company: {client_company}
+- Client contacts: {client_contacts}
 - Project type: {project_type}
 - Business area: {business_area}
 - Tags: {tags}
+- Project manager: {project_manager}
 - Team: {project_members}
 - Period: {start_date} to {due_date}
 - Description: {description}
@@ -1604,6 +1937,96 @@ def _base_name(title: str) -> str:
     return _VERSION_RE.sub("", title).rstrip("._- ").lower()
 
 
+def _clickable_url(url: str) -> str:
+    u = str(url or "").strip()
+    return u if u.lower().startswith(("http://", "https://")) else ""
+
+
+def _infer_doc_type(title: str) -> str:
+    t = title.lower()
+    if t.endswith((".pptx", ".ppt")):
+        return "Presentation"
+    if t.endswith((".pdf",)):
+        if "quote" in t or t.startswith("ce_"):
+            return "Cost Estimate"
+        if "_op summary" in t or "po" in t:
+            return "PO Summary"
+        return "PDF Deliverable"
+    if t.endswith((".indd",)):
+        return "InDesign File"
+    if t.endswith((".psd", ".ai", ".eps")):
+        return "Design Asset"
+    if t.endswith((".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")):
+        return "Image Asset"
+    if t.endswith((".docx", ".doc")):
+        return "Word Document"
+    if t.endswith((".xlsx", ".xls", ".csv")):
+        return "Spreadsheet"
+    if t.endswith((".mp4", ".mov", ".avi")):
+        return "Video"
+    if t.startswith("ce_"):
+        return "Cost Estimate"
+    return "Document"
+
+
+def _build_source_documents_table(source_docs: list[dict]) -> str:
+    """Deterministic Source Documents table — URLs never depend on LLM output."""
+    lines = [
+        "## Source Documents",
+        "",
+        "| # | Document | Type | Link |",
+        "|---|----------|------|------|",
+    ]
+    for doc in source_docs:
+        idx = doc["index"]
+        title = str(doc.get("title") or "").replace("|", "\\|")
+        doc_type = doc.get("type") or _infer_doc_type(title)
+        url = _clickable_url(doc.get("url") or "")
+        if url:
+            doc_cell = f"[{title}]({url})"
+            link_cell = f"[Open ↗]({url})"
+        else:
+            doc_cell = title
+            link_cell = "—"
+        lines.append(f"| {idx} | {doc_cell} | {doc_type} | {link_cell} |")
+    return "\n".join(lines)
+
+
+def _replace_source_documents_section(markdown: str, table_section: str) -> str:
+    """Replace any LLM-generated Source Documents section with our authoritative table."""
+    pattern = r"\n## Source Documents\s*\n[\s\S]*$"
+    if re.search(pattern, markdown, re.IGNORECASE):
+        markdown = re.sub(pattern, "", markdown, flags=re.IGNORECASE)
+    return markdown.rstrip() + "\n\n" + table_section
+
+
+def _linkify_citations(markdown: str, source_docs: list[dict]) -> str:
+    """Turn [N] and [N, M] footnotes into links (Drive URL or in-page anchor)."""
+    url_by_index = {
+        int(d["index"]): _clickable_url(d.get("url") or "")
+        for d in source_docs
+        if d.get("index") is not None
+    }
+
+    def _link_one(n: int) -> str:
+        url = url_by_index.get(n, "")
+        if url:
+            return f"[{n}]({url})"
+        return f"[{n}](#source-{n})"
+
+    def _repl(match: re.Match) -> str:
+        nums = [int(x.strip()) for x in match.group(1).split(",")]
+        return ", ".join(_link_one(n) for n in nums)
+
+    return re.sub(r"(?<!\()\[(\d+(?:,\s*\d+)*)\](?!\()", _repl, markdown)
+
+
+def _finalize_wiki_markdown(markdown: str, source_docs: list[dict]) -> str:
+    table = _build_source_documents_table(source_docs)
+    markdown = _replace_source_documents_section(markdown, table)
+    return _linkify_citations(markdown, source_docs)
+
+
 def _prefilter_docs(docs: list, project_no: str) -> list:
     """
     Reduce the raw mapped-document list to the most relevant, clean set:
@@ -1618,8 +2041,9 @@ def _prefilter_docs(docs: list, project_no: str) -> list:
         (PO summary for a different project / person — a common false positive)
 
     De-duplicate by base name, keeping the highest version.
-    Cap the result at 20 documents.
+    Cap the result at WIKI_PREFILTER_CAP (default 35).
     """
+    cap = int(os.getenv("WIKI_PREFILTER_CAP", "35"))
     kept: list[dict] = []
     for doc in docs:
         title = str(doc.get("title") or "")
@@ -1654,7 +2078,7 @@ def _prefilter_docs(docs: list, project_no: str) -> list:
     result = sorted(best.values(),
                     key=lambda d: _doc_version(str(d.get("title") or "")),
                     reverse=True)
-    return result[:20]
+    return result[:cap]
 
 
 def generate_wiki_for_project(project_id: str):
@@ -1665,14 +2089,16 @@ def generate_wiki_for_project(project_id: str):
     if not project:
         raise RuntimeError(f"Project not found in BigQuery: {project_id}")
 
-    wiki_doc_limit = int(os.getenv("WIKI_MAX_SOURCE_DOCS", "30"))
-    wiki_char_limit = int(os.getenv("WIKI_SOURCE_CHARS", "12000"))
+    wiki_doc_limit = int(os.getenv("WIKI_MAX_SOURCE_DOCS", "50"))
+    wiki_char_limit = int(os.getenv("WIKI_SOURCE_CHARS", "18000"))
+    prefilter_cap = int(os.getenv("WIKI_PREFILTER_CAP", "35"))
     docs = get_project_documents(project_id, limit=wiki_doc_limit)
 
     # Use actual projects schema field names
     project_name = _row(project, "project_name")
     project_no = _row(project, "project_no") or project_id
     client_company = _row(project, "client_company")
+    client_contacts = _row(project, "client_contacts")
     project_manager = _row(project, "project_manager_name") or _row(project, "project_manager")
     project_members = _row(project, "project_members")
     project_type = _row(project, "project_type")
@@ -1694,6 +2120,7 @@ def generate_wiki_for_project(project_id: str):
         "project_name": project_name,
         "project_no": project_no,
         "client_company": client_company,
+        "client_contacts": str(client_contacts or ""),
         "project_manager": str(project_manager or ""),
         "project_members": project_members,
         "status_name": str(status_name or ""),
@@ -1728,6 +2155,8 @@ def generate_wiki_for_project(project_id: str):
             facts.append(f"- **Project manager:** {project_manager}")
         if project_members:
             facts.append(f"- **Team:** {project_members}")
+        if client_contacts:
+            facts.append(f"- **Client contacts:** {client_contacts}")
         if business_area:
             facts.append(f"- **Business area:** {business_area}")
         if client_country:
@@ -1754,11 +2183,7 @@ def generate_wiki_for_project(project_id: str):
         }))
         return
 
-    def _clickable(url: str) -> str:
-        u = str(url or "").strip()
-        return u if u.lower().startswith(("http://", "https://")) else ""
-
-    # Pre-filter: remove noise, deduplicate versions, cap at 20
+    # Pre-filter: remove noise, deduplicate versions, cap at prefilter_cap
     filtered_docs = _prefilter_docs(
         [{"title": _row(d, "title"),
           "document_id": _row(d, "document_id"),
@@ -1796,16 +2221,30 @@ def generate_wiki_for_project(project_id: str):
                  "document_id": _row(d, "document_id")} not in
                 [{"title": x["title"], "document_id": x["document_id"]} for x in filtered_docs]
         ]
-        filtered_docs = (filtered_docs + supplement)[:20]
+        filtered_docs = (filtered_docs + supplement)[:prefilter_cap]
 
     source_docs = [
         {
             "index": i + 1,
             "title": d["title"],
-            "url": _clickable(d.get("source_url") or "") or _clickable(d.get("url") or ""),
+            "document_id": d.get("document_id") or "",
+            "type": _infer_doc_type(str(d.get("title") or "")),
+            "url": _clickable_url(d.get("source_url") or "")
+            or _clickable_url(d.get("url") or ""),
             "content": (d.get("full_text") or d.get("text_preview") or "")[:wiki_char_limit],
         }
         for i, d in enumerate(filtered_docs)
+    ]
+
+    base_doc["source_documents"] = [
+        {
+            "index": sd["index"],
+            "title": sd["title"],
+            "document_id": sd["document_id"],
+            "type": sd["type"],
+            "url": sd["url"],
+        }
+        for sd in source_docs
     ]
 
     # Build one prose background paragraph — field names never appear in the prompt
@@ -1818,11 +2257,25 @@ def generate_wiki_for_project(project_id: str):
             line += f", running {start_date or '?'} to {due_date or 'ongoing'}"
         line += "."
         bg.append(line)
+    elif project_no and project_type:
+        line = f"{project_no} is a {project_type} project"
+        if start_date or due_date:
+            line += f", running {start_date or '?'} to {due_date or 'ongoing'}"
+        line += "."
+        bg.append(line)
+    if client_contacts:
+        bg.append(f"Client-side contacts: {client_contacts}.")
     if description:
         bg.append(description.strip().rstrip(".") + ".")
     team_bits = ", ".join(p for p in [project_manager, project_members] if p)
     if team_bits:
-        bg.append(f"The Admind team includes: {team_bits}.")
+        bg.append(f"The Admind team on this project: {team_bits}.")
+    if client_country:
+        bg.append(f"Client country: {client_country}.")
+    if po_number:
+        bg.append(f"PO reference: {po_number}.")
+    if tags:
+        bg.append(f"Tags: {tags}.")
     background_para = " ".join(bg) or f"{project_no} — {project_name}."
 
     prompt = f"""You are a senior Admind account manager writing a comprehensive internal project wiki.
@@ -1847,9 +2300,10 @@ SOURCE DOCUMENTS (numbered — use [N] footnotes in prose):
    "Not found in available sources", "N/A", or "Unknown".
 5. Do not invent facts. But do write confidently from background context —
    that data is verified and you do not need to cite it.
-6. Length: aim for a wiki page a colleague would read in 3–5 minutes.
+6. Length: aim for a wiki page a colleague would read in 5–8 minutes.
    Each narrative section should be as long as the evidence supports.
-   Prefer depth over brevity.
+   Prefer depth over brevity — extract every fact from every source.
+7. Do NOT write the Source Documents table — it is appended automatically.
 
 ━━━ STRUCTURE ━━━
 
@@ -1893,12 +2347,13 @@ Omit if no technical detail is available.
 
 ## Team & Stakeholders
 **Admind Team**
-List every Admind person mentioned in background context or sources with their
-role (e.g. Project Manager, Senior Designer, Copywriter). One line each.
+List every Admind person from the background context (project manager and all
+team members). One line each with role if known.
 
 **Client Contacts**
-List every named client-side contact with their role or affiliation. One line
-each. Pull names from PO summaries, emails, or quote documents.
+List client-side contacts from the background context. If the client company is
+unknown but a contact name appears in the project name or Scoro metadata, list
+that person with their inferred affiliation.
 
 **External Partners / Vendors**
 Only include if explicitly evidenced in the sources.
@@ -1917,21 +2372,15 @@ List only genuine, actionable gaps:
 - Scope ambiguities that could cause rework.
 Omit entirely if there are no open items.
 
-## Source Documents
-| # | Document | Type | Link |
-|---|----------|------|------|
-
-List every source document. This is the ONLY place where full filenames and
-URLs appear. Infer a concise Type from the filename (e.g. Presentation, PDF
-Deliverable, InDesign File, Cost Estimate, PO Summary, Image Asset, Folder).
-
 ━━━
 
-Return ONLY the Markdown page. No preamble, no wrapping code fences.
+Return ONLY the Markdown page (omit ## Source Documents — added post-process).
+No preamble, no wrapping code fences.
 """
 
     markdown = generate_text(prompt, temperature=0.2, json_mode=False,
                              model_name=WIKI_MODEL_NAME)
+    markdown = _finalize_wiki_markdown(markdown, source_docs)
     model_used = active_llm_label()
     chunks = _split_utf8_chunks(markdown, WIKI_CHUNK_BYTES)
 

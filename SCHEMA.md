@@ -24,6 +24,7 @@ Cleaned/normalised project records upserted from Scoro via `scoro-sync`.
 | `completed_date` | STRING | Completion date (nullable) |
 | `description` | STRING | Project description |
 | `client_company` | STRING | Client company name |
+| `client_contacts` | STRING | Comma-separated client-side contact names (from Scoro related objects + project name) |
 | `project_type` | STRING | e.g. Branding, Digital |
 | `client_country` | STRING | Client country |
 | `business_area` | STRING | Business area tag |
