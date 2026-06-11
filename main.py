@@ -1582,6 +1582,80 @@ def taxonomy_sync():
 # Reads matched documents and writes Markdown wiki pages to Firestore
 # ---------------------------------------------------------------------------
 
+# Internal Admind document patterns that are never about a single project
+_NOISE_PATTERNS = re.compile(
+    r"Utilization_Report|PLANNING\s|Admind_Purchased|project.categories|"
+    r"\bJira\b|^TV\s*-\s*\d|_OP\s+Summary_|Handover_",
+    re.IGNORECASE,
+)
+
+# Filename version suffix, e.g. _V3, _v02, _V1_final
+_VERSION_RE = re.compile(r"[_\s-]v(\d+)([_.\s]|$)", re.IGNORECASE)
+
+
+def _doc_version(title: str) -> int:
+    """Return the numeric version suffix of a filename, or 0 if absent."""
+    m = _VERSION_RE.search(title)
+    return int(m.group(1)) if m else 0
+
+
+def _base_name(title: str) -> str:
+    """Strip version suffix so files that share a base name can be compared."""
+    return _VERSION_RE.sub("", title).rstrip("._- ").lower()
+
+
+def _prefilter_docs(docs: list, project_no: str) -> list:
+    """
+    Reduce the raw mapped-document list to the most relevant, clean set:
+
+    Keep rules (any one is enough):
+      - Title contains the project number string (strongest signal)
+      - Title starts with CE_ (quotes / cost estimates for this project)
+
+    Reject rules (always drop if matched):
+      - Matches _NOISE_PATTERNS (internal ops docs with no project content)
+      - Title contains '_OP Summary_' and does NOT contain the project number
+        (PO summary for a different project / person — a common false positive)
+
+    De-duplicate by base name, keeping the highest version.
+    Cap the result at 20 documents.
+    """
+    kept: list[dict] = []
+    for doc in docs:
+        title = str(doc.get("title") or "")
+
+        # Always drop noise
+        if _NOISE_PATTERNS.search(title):
+            continue
+
+        has_project_no = project_no and project_no in title
+        is_quote = title.upper().startswith("CE_")
+
+        # Drop PO/OP summaries that belong to a different project
+        if "_OP Summary_" in title or "_OP_Summary_" in title:
+            if not has_project_no:
+                continue
+
+        # Keep if strong signal; otherwise skip
+        if not (has_project_no or is_quote):
+            continue
+
+        kept.append(doc)
+
+    # De-duplicate: keep highest version per base name
+    best: dict[str, dict] = {}
+    for doc in kept:
+        base = _base_name(str(doc.get("title") or ""))
+        existing = best.get(base)
+        if existing is None or _doc_version(str(doc.get("title") or "")) > _doc_version(str(existing.get("title") or "")):
+            best[base] = doc
+
+    # Sort by descending version so final deliverables appear first
+    result = sorted(best.values(),
+                    key=lambda d: _doc_version(str(d.get("title") or "")),
+                    reverse=True)
+    return result[:20]
+
 
 def generate_wiki_for_project(project_id: str):
     run_id = str(uuid.uuid4())
@@ -1681,111 +1755,125 @@ def generate_wiki_for_project(project_id: str):
         return
 
     def _clickable(url: str) -> str:
-        """Only http(s) links are usable by readers; gs:// connector URIs are not."""
         u = str(url or "").strip()
         return u if u.lower().startswith(("http://", "https://")) else ""
 
+    # Pre-filter: remove noise, deduplicate versions, cap at 20
+    filtered_docs = _prefilter_docs(
+        [{"title": _row(d, "title"),
+          "document_id": _row(d, "document_id"),
+          "source_url": _row(d, "source_url"),
+          "url": _row(d, "url"),
+          "full_text": _row(d, "full_text"),
+          "text_preview": _row(d, "text_preview")}
+         for d in docs],
+        project_no,
+    )
+
+    # Fallback: if filtering stripped everything, use top-5 by classifier confidence
+    if not filtered_docs:
+        filtered_docs = [
+            {"title": _row(d, "title"),
+             "document_id": _row(d, "document_id"),
+             "source_url": _row(d, "source_url"),
+             "url": _row(d, "url"),
+             "full_text": _row(d, "full_text"),
+             "text_preview": _row(d, "text_preview")}
+            for d in docs[:5]
+        ]
+
     source_docs = [
         {
-            "document_id": _row(doc, "document_id"),
-            "title": _row(doc, "title"),
-            "url": _clickable(_row(doc, "source_url")) or _clickable(_row(doc, "url")),
-            "content": (_row(doc, "full_text") or _row(doc, "text_preview") or "")[:wiki_char_limit],
+            "index": i + 1,
+            "title": d["title"],
+            "url": _clickable(d.get("source_url") or "") or _clickable(d.get("url") or ""),
+            "content": (d.get("full_text") or d.get("text_preview") or "")[:wiki_char_limit],
         }
-        for doc in docs
+        for i, d in enumerate(filtered_docs)
     ]
 
-    prompt = f"""
-You are a senior account manager at Admind Agency, a creative branding studio.
-You are writing the internal knowledge-base page for one project. Your reader is
-a colleague who needs to take over or support this project tomorrow â€” give them
-everything you know, clearly organised, the way deepwiki.com describes a codebase.
+    # Build one prose background paragraph — field names never appear in the prompt
+    bg = []
+    if project_no and project_type and client_company:
+        line = f"{project_no} is a {project_type} project for {client_company}"
+        if business_area:
+            line += f" in the {business_area} practice area"
+        if start_date or due_date:
+            line += f", running {start_date or '?'} to {due_date or 'ongoing'}"
+        line += "."
+        bg.append(line)
+    if description:
+        bg.append(description.strip().rstrip(".") + ".")
+    team_bits = ", ".join(p for p in [project_manager, project_members] if p)
+    if team_bits:
+        bg.append(f"The Admind team includes: {team_bits}.")
+    background_para = " ".join(bg) or f"{project_no} — {project_name}."
 
-PROJECT RECORD (from Scoro â€” this data is verified, use it freely):
-- Project number: {project_no}
-- Project name: {project_name}
-- Client: {client_company}
-- Client country: {client_country}
-- Status: {status_name}
-- Project manager: {project_manager}
-- Team members: {project_members}
-- Period: {start_date} to {due_date}
-- Project type: {project_type}
-- Business area: {business_area}
-- Business line / division: {business_division}
-- Tags: {tags}
-- Budget type: {budget_type}
-- PO number: {po_number}
-- Priority: {priority}
-- Google Drive folder: {drive_link}
-- Description: {description}
+    prompt = f"""You are a senior account manager at Admind Agency writing an internal project wiki.
+Your reader needs to take over or support this project tomorrow.
 
-SOURCE DOCUMENTS (verbatim extracts â€” your only other evidence):
+Background context — synthesise into your narrative, do NOT cite these facts by
+field name or label:
+{background_para}
+
+SOURCE DOCUMENTS (numbered — cite by footnote number [1][2] only):
 {json.dumps(source_docs, ensure_ascii=False)}
 
-WRITING STYLE â€” follow strictly:
-1. Write in direct present tense. State facts immediately.
-   GOOD: "Admind designs and builds the ABB Integrated Report 2026 website for ABB's corporate communications team."
-   BAD:  "This project involves work on a website." / "The project pertains to..."
-2. NEVER open a sentence with "This project", "The project", "It involves" or
-   any vague filler. Name the actual deliverable, client, and people.
-3. Be specific and concrete: name files, people, dates, tools, vendors, and
-   deliverables exactly as they appear in the sources.
-4. Do NOT invent facts. Everything beyond the project record must come from the
-   source documents.
-5. If a section has no substantive information, OMIT THE ENTIRE SECTION.
-   Never write "Not found in available sources", "N/A", "Unknown" or any
-   placeholder. A shorter, denser page is better than a padded one.
-6. Only use information from documents that are genuinely about THIS project
-   (project number {project_no} / this exact deliverable). If a source document
-   is clearly about a different project, ignore it completely.
+Write a professional internal project wiki in Markdown. Rules:
+- NEVER cite facts from the background context block by field name. Do not write
+  "Project description", "Project record", "Period:", "Status:", or any other
+  field label from that block.
+- Inline citations use footnote numbers [1][2] matching the source index above.
+  Filenames and URLs belong only in the Source Documents table at the bottom.
+- Never start any sentence with "This project".
+- Omit any section that has no substantive information. Never write
+  "Not found in available sources", "N/A" or "Unknown".
+- Do not invent facts. Everything must come from the background context or the
+  numbered source documents.
+- Write in direct present tense. Name the actual deliverable, client, and
+  people — never vague openers like "The project involves…".
 
-LINK RULES â€” follow strictly:
-- When citing a document, hyperlink its title: [Document title](url).
-- Use a document's url ONLY if it starts with http:// or https://. If a
-  document has no such url, mention its title in plain text WITHOUT a link and
-  WITHOUT inventing one. Never print a raw URL, a gs:// URI, or a bare filename
-  as link text for a URL.
-- Never paste long raw file paths or URLs into prose.
-
-STRUCTURE â€” use these sections, omitting any that would be empty:
+---
 
 # {project_name}
 
-One opening paragraph (2â€“4 sentences): what Admind delivers, for whom, why, and
-where it stands now. This paragraph is mandatory â€” write it from the project
-record even if sources are thin.
-
 ## Overview
-A factual narrative (1â€“3 paragraphs) of the engagement: deliverable, client
-context, scope and current state. Weave in dates, team and tags naturally.
+One paragraph, 4–6 sentences. What was produced, for whom, why it matters,
+current status. Senior account-manager voice. No bullets. No inline citations.
 
-## Deliverables & Scope
-Concrete deliverables, channels, formats, markets, workstreams â€” as a list or
-short table. Only include what the sources support.
-
-## Timeline & Milestones
-Dates, milestones, approvals, delivery moments. Include the Scoro period.
+## Deliverables
+Group final deliverables by type (e.g. Print / Digital / Motion). For each,
+one sentence describing what it is and its intended use, followed by a
+[Open in Drive](url) link where a URL is available. Show only the highest
+version of each file — omit intermediate versions (V0, V1, V2 when V3 exists).
 
 ## Team & Stakeholders
-- **Admind:** project manager and team members (from the project record), plus
-  any roles evidenced in sources.
-- **Client:** named client-side stakeholders.
-- **External partners / vendors:** only if evidenced in sources for THIS project.
+Two clean lists:
+- **Admind Team** — names and roles only
+- **Client Contacts** — names and roles only
+No filename citations in this section.
 
-## Key Decisions & Status
-Decisions, approvals, scope changes â€” each citing its source document.
+## Timeline & Milestones
+Only meaningful milestones: quote date, kick-off, first delivery, final
+delivery, approval. Not every file version.
 
-## Working Materials
-The important files for this project, each as a hyperlinked title (per the link
-rules) with one line on what it contains and why it matters. Skip files without
-substance.
+## Key Decisions & Brief
+What the client asked for and any documented constraints or clarifications.
+Prose, 3–5 sentences.
 
-## Open Questions & Risks
-Genuine open items, dependencies, blockers, or gaps a successor must know.
-Omit if there are none worth flagging.
+## Risks & Open Items
+Only genuine gaps: missing brief, unresolved feedback, unclear scope.
+Omit this section entirely if there are none.
 
-Return ONLY the Markdown page. No preamble, no code fences around the whole page.
+## Source Documents
+A Markdown table listing every source document used:
+| # | Document | Type | Link |
+
+This is the ONLY place where full filenames and URLs appear.
+
+---
+
+Return ONLY the Markdown page. No preamble, no wrapping code fences.
 """
 
     markdown = generate_text(prompt, temperature=0.2, json_mode=False,
