@@ -708,16 +708,48 @@ def fetch_scoro_project_related(
     return row if isinstance(row, dict) else {}
 
 
+def _custom_fields_dict(raw: dict) -> dict:
+    """
+    Return a project's custom fields as a {key: value} dict, regardless of the
+    shape Scoro returns. The API gives either an object ({c_projecttype: ...}),
+    an empty list [] when there are none, or a list of field objects
+    ([{name/field_name/code/key: ..., value: ...}, ...]). Anything else → {}.
+    """
+    cf = raw.get("customFields")
+    if cf is None:
+        cf = raw.get("custom_fields")
+
+    if isinstance(cf, dict):
+        return cf
+
+    if isinstance(cf, (list, tuple)):
+        out: dict = {}
+        for item in cf:
+            if not isinstance(item, dict):
+                continue
+            key = (
+                item.get("name")
+                or item.get("field_name")
+                or item.get("code")
+                or item.get("key")
+                or item.get("id")
+            )
+            if key is None:
+                continue
+            out[str(key)] = item.get("value", item.get("values"))
+        return out
+
+    return {}
+
+
 def _merge_project_detail(base: dict, detail: dict) -> dict:
     """Overlay view/detailed fields onto a list row without dropping list data."""
     out = dict(base)
     for key, val in detail.items():
-        if key in ("customFields", "custom_fields") and isinstance(val, dict):
-            existing = out.get("customFields") or out.get("custom_fields") or {}
-            if isinstance(existing, dict):
-                out["customFields"] = {**existing, **val}
-            else:
-                out["customFields"] = val
+        if key in ("customFields", "custom_fields"):
+            merged_cf = {**_custom_fields_dict(base), **_custom_fields_dict(detail)}
+            out["customFields"] = merged_cf
+            out.pop("custom_fields", None)
         elif val not in (None, "", [], {}):
             out[key] = val
     return out
@@ -869,9 +901,10 @@ def _resolve_project_team(
     if admind_hint:
         add(admind_hint)
 
-    if related:
-        users_mod = related.get("users") or {}
-        for user in users_mod.get("items") or []:
+    if isinstance(related, dict):
+        users_mod = related.get("users")
+        items = users_mod.get("items") if isinstance(users_mod, dict) else users_mod
+        for user in items or []:
             if not isinstance(user, dict):
                 continue
             add(
@@ -892,7 +925,7 @@ def _resolve_client_info(
     related: dict | None = None,
 ) -> tuple[str, str]:
     """Return (client_company, client_contacts) from every available Scoro source."""
-    cf = raw.get("customFields") or raw.get("custom_fields") or {}
+    cf = _custom_fields_dict(raw)
 
     def custom(key: str) -> str:
         val = cf.get(key)
@@ -921,8 +954,13 @@ def _resolve_client_info(
     if client_hint:
         add_contact(client_hint)
 
-    if related:
-        for company in (related.get("companies") or {}).get("items") or []:
+    def _related_items(module: str) -> list:
+        mod = related.get(module) if isinstance(related, dict) else None
+        items = mod.get("items") if isinstance(mod, dict) else mod
+        return items or []
+
+    if isinstance(related, dict):
+        for company in _related_items("companies"):
             if not isinstance(company, dict):
                 continue
             name = str(company.get("name") or "").strip()
@@ -930,7 +968,7 @@ def _resolve_client_info(
                 client_company = name
             elif name:
                 add_contact(name)
-        for contact in (related.get("contacts") or {}).get("items") or []:
+        for contact in _related_items("contacts"):
             if isinstance(contact, dict):
                 add_contact(_contact_display(contact))
 
@@ -946,7 +984,7 @@ def _scoro_enrich_in_scope(raw: dict) -> bool:
 
 
 def _project_needs_enrichment(raw: dict, company_cache: dict[str, str]) -> bool:
-    cf = raw.get("customFields") or raw.get("custom_fields") or {}
+    cf = _custom_fields_dict(raw)
     company_id = str(raw.get("company_id") or cf.get("c_clientcompany") or "")
     has_client = bool(
         str(raw.get("company_name") or "").strip()
@@ -992,7 +1030,7 @@ def enrich_scoro_project(
         except Exception as e:
             logger.warning("scoro-sync: projects/view/%s failed: %s", scoro_id, e)
 
-    cf = merged.get("customFields") or merged.get("custom_fields") or {}
+    cf = _custom_fields_dict(merged)
     company_id = str(merged.get("company_id") or cf.get("c_clientcompany") or "")
     still_no_client = not (
         str(merged.get("company_name") or "").strip()
@@ -1039,7 +1077,8 @@ def normalize_scoro_project(
 
     # Scoro API v2 nests every custom field under customFields.{key}.
     # Reading them as top-level keys always returned None (audit Â§3).
-    cf = raw.get("customFields") or raw.get("custom_fields") or {}
+    # customFields may also arrive as a list (or empty list) — normalise to a dict.
+    cf = _custom_fields_dict(raw)
 
     def custom(key: str) -> str:
         val = cf.get(key)
