@@ -1770,7 +1770,7 @@ def generate_wiki_for_project(project_id: str):
         project_no,
     )
 
-    # Fallback: if filtering stripped everything, use top-5 by classifier confidence
+    # Fallback A: filter removed everything → top-10 by classifier confidence
     if not filtered_docs:
         filtered_docs = [
             {"title": _row(d, "title"),
@@ -1779,8 +1779,24 @@ def generate_wiki_for_project(project_id: str):
              "url": _row(d, "url"),
              "full_text": _row(d, "full_text"),
              "text_preview": _row(d, "text_preview")}
-            for d in docs[:5]
+            for d in docs[:10]
         ]
+    # Fallback B: very few filtered docs → supplement with non-noise docs up to 20
+    elif len(filtered_docs) < 4:
+        supplement = [
+            {"title": _row(d, "title"),
+             "document_id": _row(d, "document_id"),
+             "source_url": _row(d, "source_url"),
+             "url": _row(d, "url"),
+             "full_text": _row(d, "full_text"),
+             "text_preview": _row(d, "text_preview")}
+            for d in docs
+            if not _NOISE_PATTERNS.search(str(_row(d, "title")))
+            and {"title": _row(d, "title"),
+                 "document_id": _row(d, "document_id")} not in
+                [{"title": x["title"], "document_id": x["document_id"]} for x in filtered_docs]
+        ]
+        filtered_docs = (filtered_docs + supplement)[:20]
 
     source_docs = [
         {
@@ -1809,69 +1825,107 @@ def generate_wiki_for_project(project_id: str):
         bg.append(f"The Admind team includes: {team_bits}.")
     background_para = " ".join(bg) or f"{project_no} — {project_name}."
 
-    prompt = f"""You are a senior account manager at Admind Agency writing an internal project wiki.
-Your reader needs to take over or support this project tomorrow.
+    prompt = f"""You are a senior Admind account manager writing a comprehensive internal project wiki.
+Your reader is a colleague who must take over or support this project tomorrow —
+give them everything they could possibly need to know.
 
-Background context — synthesise into your narrative, do NOT cite these facts by
-field name or label:
+Background context — synthesise freely into your narrative.
+Do NOT echo field names, labels, or key-value pairs from this block:
 {background_para}
 
-SOURCE DOCUMENTS (numbered — cite by footnote number [1][2] only):
+SOURCE DOCUMENTS (numbered — use [N] footnotes in prose):
 {json.dumps(source_docs, ensure_ascii=False)}
 
-Write a professional internal project wiki in Markdown. Rules:
-- NEVER cite facts from the background context block by field name. Do not write
-  "Project description", "Project record", "Period:", "Status:", or any other
-  field label from that block.
-- Inline citations use footnote numbers [1][2] matching the source index above.
-  Filenames and URLs belong only in the Source Documents table at the bottom.
-- Never start any sentence with "This project".
-- Omit any section that has no substantive information. Never write
-  "Not found in available sources", "N/A" or "Unknown".
-- Do not invent facts. Everything must come from the background context or the
-  numbered source documents.
-- Write in direct present tense. Name the actual deliverable, client, and
-  people — never vague openers like "The project involves…".
+━━━ WRITING RULES ━━━
+1. Write in direct present tense. Never open a sentence with "This project".
+2. Be specific and rich: extract every detail from the sources — file specs,
+   page counts, format dimensions, language versions, revision history,
+   strategic rationale, client feedback, PO numbers, quote amounts.
+3. Inline citations use [N] matching the source index. Filenames and URLs
+   appear ONLY in the Source Documents table.
+4. Omit a section only if you truly have zero information for it. Never write
+   "Not found in available sources", "N/A", or "Unknown".
+5. Do not invent facts. But do write confidently from background context —
+   that data is verified and you do not need to cite it.
+6. Length: aim for a wiki page a colleague would read in 3–5 minutes.
+   Each narrative section should be as long as the evidence supports.
+   Prefer depth over brevity.
 
----
+━━━ STRUCTURE ━━━
 
 # {project_name}
 
 ## Overview
-One paragraph, 4–6 sentences. What was produced, for whom, why it matters,
-current status. Senior account-manager voice. No bullets. No inline citations.
+2–4 paragraphs. Cover: what Admind is producing and for whom; why the client
+needs it and what strategic or business goal it serves; the current production
+state; and any notable context (campaign, event, deadline, market). Write as a
+senior account manager briefing the wider team — knowledgeable, precise, no
+filler. No bullets here.
+
+## Client & Brief
+Detail what the client asked for. Include:
+- The specific request or brief (format, dimensions, languages, usage channel,
+  audience, tone, key messages, number of assets).
+- Any documented constraints, feedback, or clarifications from the sources.
+- The strategic context: what event, campaign, or business initiative drives
+  this deliverable.
+- PO number, budget information, or quote reference if present in sources.
+Write as connected prose (2–4 paragraphs). This is one of the most valuable
+sections for a handover.
 
 ## Deliverables
-Group final deliverables by type (e.g. Print / Digital / Motion). For each,
-one sentence describing what it is and its intended use, followed by a
-[Open in Drive](url) link where a URL is available. Show only the highest
-version of each file — omit intermediate versions (V0, V1, V2 when V3 exists).
+Group by type (e.g. **Print**, **Digital**, **Motion**, **Web**). Under each
+type, list each final deliverable with:
+- A full descriptive sentence (format, dimensions, language, purpose).
+- [Open in Drive](url) link if a URL is available.
+Show only the highest version of each file — omit superseded versions.
+If a deliverable has multiple language variants, list each.
+
+## Production Notes
+What tools, templates, or technical specs apply to this project?
+- Software / file formats (InDesign, Photoshop, After Effects, Canva, etc.)
+- Brand guidelines, style guides, or template references mentioned in sources.
+- Stock image or asset library usage.
+- Print spec (CMYK, bleed, resolution) or digital spec (px, hex colours, web
+  fonts) if found in sources.
+- Any version notes or revision instructions extracted from documents.
+Omit if no technical detail is available.
 
 ## Team & Stakeholders
-Two clean lists:
-- **Admind Team** — names and roles only
-- **Client Contacts** — names and roles only
-No filename citations in this section.
+**Admind Team**
+List every Admind person mentioned in background context or sources with their
+role (e.g. Project Manager, Senior Designer, Copywriter). One line each.
+
+**Client Contacts**
+List every named client-side contact with their role or affiliation. One line
+each. Pull names from PO summaries, emails, or quote documents.
+
+**External Partners / Vendors**
+Only include if explicitly evidenced in the sources.
 
 ## Timeline & Milestones
-Only meaningful milestones: quote date, kick-off, first delivery, final
-delivery, approval. Not every file version.
-
-## Key Decisions & Brief
-What the client asked for and any documented constraints or clarifications.
-Prose, 3–5 sentences.
+List every meaningful date found in sources or background context:
+quote / PO date, project open date, first draft, client review, revision
+round(s), final delivery, intended publication / go-live date. Use a short
+table or bullet list with the date and event on each line.
 
 ## Risks & Open Items
-Only genuine gaps: missing brief, unresolved feedback, unclear scope.
-Omit this section entirely if there are none.
+List only genuine, actionable gaps:
+- Missing brief or unclear instructions still awaiting client input.
+- Unresolved client feedback that must be addressed before final delivery.
+- Dependencies on external parties or pending approvals.
+- Scope ambiguities that could cause rework.
+Omit entirely if there are no open items.
 
 ## Source Documents
-A Markdown table listing every source document used:
 | # | Document | Type | Link |
+|---|----------|------|------|
 
-This is the ONLY place where full filenames and URLs appear.
+List every source document. This is the ONLY place where full filenames and
+URLs appear. Infer a concise Type from the filename (e.g. Presentation, PDF
+Deliverable, InDesign File, Cost Estimate, PO Summary, Image Asset, Folder).
 
----
+━━━
 
 Return ONLY the Markdown page. No preamble, no wrapping code fences.
 """
