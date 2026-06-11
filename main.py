@@ -1229,7 +1229,9 @@ def discover_documents_for_project(project) -> tuple[list[dict], list[dict]]:
     page_size = int(os.getenv("DOCUMENT_LIMIT", "25"))
 
     docs_by_id: dict[str, dict] = {}
-    candidates: list[dict] = []
+    # One row per document_id — MERGE key is (project_id, document_id).
+    # The same doc can surface from multiple queries; keep the best (lowest) rank.
+    candidate_by_doc: dict[str, dict] = {}
     rank = 0
 
     for query in queries:
@@ -1246,7 +1248,7 @@ def discover_documents_for_project(project) -> tuple[list[dict], list[dict]]:
             doc_id = parsed["document_id"]
             docs_by_id.setdefault(doc_id, parsed)
             rank += 1
-            candidates.append({
+            cand = {
                 "project_id": project_id,
                 "document_id": doc_id,
                 "discovery_query": query,
@@ -1256,9 +1258,12 @@ def discover_documents_for_project(project) -> tuple[list[dict], list[dict]]:
                 "source_url": parsed["source_url"],
                 "text_preview": parsed["text_preview"],
                 "discovered_at": now_iso(),
-            })
+            }
+            existing = candidate_by_doc.get(doc_id)
+            if existing is None or rank < existing["rank"]:
+                candidate_by_doc[doc_id] = cand
 
-    return list(docs_by_id.values()), candidates
+    return list(docs_by_id.values()), list(candidate_by_doc.values())
 
 
 def upsert_documents(rows: list[dict]):
@@ -1309,6 +1314,15 @@ def upsert_document_candidates(rows: list[dict], run_id: str):
     """MERGE per-project discovery candidates (idempotent on project+document)."""
     if not rows:
         return
+
+    # BigQuery MERGE requires at most one source row per target key.
+    deduped: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        key = (str(r.get("project_id", "")), str(r.get("document_id", "")))
+        existing = deduped.get(key)
+        if existing is None or int(r.get("rank", 999999)) < int(existing.get("rank", 999999)):
+            deduped[key] = r
+    rows = list(deduped.values())
 
     string_fields = ["project_id", "document_id", "discovery_query", "title",
                      "url", "source_url", "text_preview"]

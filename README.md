@@ -264,7 +264,7 @@ gcloud run jobs create admind-taxonomy-worker \
   --service-account=project-intelligence-worker@admind-data-organisation.iam.gserviceaccount.com \
   --set-env-vars "PROJECT_ID=admind-data-organisation,DATASET=admind_data_organisation,LOCATION=europe-west4,FIRESTORE_DATABASE=admindfirestore,MODEL_NAME=gemini-2.5-flash,LLM_PROVIDER=auto,JOB_TYPE=full-sync,PROJECT_MODE=active,SCORO_PROJECT_MODE=active,PROJECT_LIMIT=20,DOCUMENT_LIMIT=25,CANDIDATE_LIMIT=50,SCORO_BASE_URL=https://admindagency.scoro.com,SCORO_COMPANY_ACCOUNT_ID=admindagency,DISCOVERY_ENGINE_PROJECT_NUMBER=493121771508,DISCOVERY_ENGINE_LOCATION=global,DISCOVERY_ENGINE_COLLECTION=default_collection,DISCOVERY_ENGINE_ENGINE_ID=gemini-enterprise-admind,DISCOVERY_ENGINE_SERVING_CONFIG=default_search,DISCOVERY_IMPERSONATE_USER=germain.safari@admindagency.com" \
   --set-secrets "GEMINI_API_KEY=gemini-api-key:latest,OPENAI_API_KEY=openai-api-key:latest,SCORO_API_KEY=scoro-api-token:latest" \
-  --task-timeout=3600 \
+  --task-timeout=10800 \
   --max-retries=0
 
 # Subsequent deploys — update image only (env vars/secrets already set)

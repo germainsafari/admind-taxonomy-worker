@@ -31,7 +31,7 @@ steps:
           --image=$_IMAGE_TAG \
           --region=$_REGION \
           --service-account=$_SERVICE_ACCOUNT \
-          --task-timeout=3600 \
+          --task-timeout=10800 \
           --max-retries=0 \
           --tasks=1 \
           --update-env-vars="$$ENV_VARS" \
@@ -41,7 +41,7 @@ steps:
           --image=$_IMAGE_TAG \
           --region=$_REGION \
           --service-account=$_SERVICE_ACCOUNT \
-          --task-timeout=3600 \
+          --task-timeout=10800 \
           --max-retries=0 \
           --tasks=1 \
           --set-env-vars="$$ENV_VARS" \
